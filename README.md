@@ -59,6 +59,44 @@ cmake ..
 cmake --build .
 ```
 
+---
+
+### Building from Source (vcpkg)
+
+Tested commit: `35c3a31` on `master`.
+
+**Prerequisites:** CMake 3.20+, vcpkg, C++17 compiler, VulkanSceneGraph installed to `~/.local`.
+
+#### Linux (Raspberry Pi 5 / x86_64)
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake \
+  -DCMAKE_PREFIX_PATH=$HOME/.local
+cmake --build build -j$(nproc)
+cmake --install build --prefix ~/.local
+```
+
+#### Windows (VS Developer Command Prompt or CLion)
+
+```bat
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
+  -DCMAKE_TOOLCHAIN_FILE=C:/Users/%USERNAME%/Projects/cppenv/vcpkg/scripts/buildsystems/vcpkg.cmake ^
+  -DCMAKE_PREFIX_PATH=%USERPROFILE%/.local
+cmake --build build --config Release
+cmake --install build --config Release --prefix %USERPROFILE%/.local
+```
+
+#### CMakePresets
+
+```bash
+cmake --preset windows-release && cmake --build --preset windows-release
+```
+
+#### Notes
+
+`CMAKE_PREFIX_PATH=~/.local` is required so CMake can find VulkanSceneGraph (built and installed in the previous step). Install location: `~/.local`.
+
 ## How to use vsgXchange in your own applications
 
 CMake additions:
