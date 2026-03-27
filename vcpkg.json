@@ -1,0 +1,16 @@
+{
+  "name": "vsgxchange",
+  "version": "0.0.1",
+  "description": "Utility library for converting data+materials to/from VulkanSceneGraph",
+  "dependencies": [
+    { "name": "ktx", "features": ["vulkan"] },
+    "assimp",
+    "freetype",
+    "openexr",
+    "curl",
+    "draco",
+    "gdal",
+    "glslang",
+    "spirv-tools"
+  ]
+}
