@@ -2,7 +2,7 @@
   "name": "vsgxchange",
   "version": "0.0.1",
   "description": "Utility library for converting data+materials to/from VulkanSceneGraph",
-  "builtin-baseline": "1cdb5e0b24c303b41fcac0dce00baf21881f6da2",
+  "builtin-baseline": "f3e10653cc27d62a37a3763cd84b38bca07c6075",
   "dependencies": [
     { "name": "ktx", "features": ["vulkan"] },
     "assimp",
