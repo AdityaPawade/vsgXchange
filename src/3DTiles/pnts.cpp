@@ -514,6 +514,22 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
             return {};
         }
 
+        // A compressed file reaches a large point count far more cheaply than
+        // an uncompressed one: 64M points is 768 MB of POSITION to download
+        // uncompressed, and a few hundred bytes of Draco. So the general
+        // MAX_POINTS ceiling above is not the operative limit here. 8M points
+        // is ~224 MB across position, colour and normal, and is already far
+        // beyond a real point-cloud tile -- Cesium's own guidance is tens to
+        // hundreds of thousands per tile.
+        constexpr size_t MAX_DRACO_POINTS = 8u * 1024u * 1024u;
+        if (N > MAX_DRACO_POINTS)
+        {
+            vsg::warn("Tiles3D::read_pnts(", filename, ") POINTS_LENGTH ", N,
+                      " exceeds the ", MAX_DRACO_POINTS,
+                      " point limit for a Draco-compressed cloud.");
+            return {};
+        }
+
         draco::DecoderBuffer decodeBuffer;
         decodeBuffer.Init(
             reinterpret_cast<const char*>(featureTable->binary->dataPointer()) + offset,
@@ -574,6 +590,59 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
         // BATCH_ID is in `props` too. Nothing reads it yet, and it is listed
         // here rather than silently ignored so the next person can see that the
         // id is available and only the destination is missing.
+
+        // Now DISCARD the uncompressed reading of everything the blob owns.
+        //
+        // convert() has already resolved POSITION, RGB and NORMAL against the
+        // binary section, and for a compressed file their byteOffsets point
+        // INTO the blob -- so those arrays hold compressed bytes reinterpreted
+        // as floats and colour channels. Nothing below may fall back to them.
+        // The one that bites is a semantic the extension claims but whose
+        // attribute will not decode: the colour would silently become
+        // compressed noise while the cloud still drew, which is the failure
+        // this whole path exists to prevent.
+        //
+        // Only what `properties` NAMES is cleared. A partially compressed file
+        // -- pointCloudDracoPartial.pnts compresses position alone and leaves
+        // RGB and NORMAL uncompressed further down the same section -- must
+        // keep the semantics the blob does not own.
+        // Anything whose byteOffset lands INSIDE the blob is compressed data
+        // however it is labelled. An attacker who simply omits RGB from
+        // `properties` while leaving it declared at byteOffset 0 would
+        // otherwise get the blob's header read as colour channels -- the same
+        // failure, reached by not claiming the semantic rather than by
+        // claiming it badly.
+        const auto overlapsBlob = [&](uint32_t semanticOffset, bool present)
+        {
+            return present && semanticOffset >= offset && semanticOffset < offset + length;
+        };
+        if (overlapsBlob(featureTable->POSITION.byteOffset, (bool)featureTable->POSITION))
+            featureTable->POSITION.values.clear();
+        if (overlapsBlob(featureTable->POSITION_QUANTIZED.byteOffset, (bool)featureTable->POSITION_QUANTIZED))
+            featureTable->POSITION_QUANTIZED.values.clear();
+        if (overlapsBlob(featureTable->RGBA.byteOffset, (bool)featureTable->RGBA))
+            featureTable->RGBA.values.clear();
+        if (overlapsBlob(featureTable->RGB.byteOffset, (bool)featureTable->RGB))
+            featureTable->RGB.values.clear();
+        if (overlapsBlob(featureTable->RGB565.byteOffset, (bool)featureTable->RGB565))
+            featureTable->RGB565.values.clear();
+        if (overlapsBlob(featureTable->NORMAL.byteOffset, (bool)featureTable->NORMAL))
+            featureTable->NORMAL.values.clear();
+        if (overlapsBlob(featureTable->NORMAL_OCT16P.byteOffset, (bool)featureTable->NORMAL_OCT16P))
+            featureTable->NORMAL_OCT16P.values.clear();
+
+        for (const auto& [semantic, id] : props)
+        {
+            (void)id;
+            if (semantic == "POSITION") featureTable->POSITION.values.clear();
+            else if (semantic == "POSITION_QUANTIZED") featureTable->POSITION_QUANTIZED.values.clear();
+            else if (semantic == "RGBA") featureTable->RGBA.values.clear();
+            else if (semantic == "RGB") featureTable->RGB.values.clear();
+            else if (semantic == "RGB565") featureTable->RGB565.values.clear();
+            else if (semantic == "NORMAL") featureTable->NORMAL.values.clear();
+            else if (semantic == "NORMAL_OCT16P") featureTable->NORMAL_OCT16P.values.clear();
+            else if (semantic == "BATCH_ID") featureTable->BATCH_ID.values.clear();
+        }
 
         dracoDecoded = true;
 #else

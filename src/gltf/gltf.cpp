@@ -1783,7 +1783,26 @@ vsg::ref_ptr<vsg::Object> gltf::read_glb(std::istream& fin, vsg::ref_ptr<const v
 
             if (firstBuffer->uri.empty() && sizeIsUsable)
             {
-                firstBuffer->data = binaryData;
+                // Hand over the DECLARED length, not the whole chunk.
+                //
+                // The padding belongs to the chunk, not to the buffer, and
+                // every bufferView in the document is defined against the
+                // buffer. Passing the longer object would make those trailing
+                // bytes addressable: a file could declare byteLength 1, ship a
+                // four-byte chunk of real content, and put a bufferView at byte
+                // 1 -- reading three bytes that are outside the buffer it
+                // declared. Trimming here keeps the relaxation to exactly what
+                // the specification asks for, without a copy.
+                if (binarySize > firstBuffer->byteLength)
+                {
+                    firstBuffer->data = vsg::ubyteArray::create(
+                        binaryData, 0, sizeof(uint8_t),
+                        static_cast<uint32_t>(firstBuffer->byteLength));
+                }
+                else
+                {
+                    firstBuffer->data = binaryData;
+                }
             }
             else
             {
