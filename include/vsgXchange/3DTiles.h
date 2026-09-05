@@ -236,6 +236,45 @@ namespace vsgXchange
             void report(vsg::LogOutput& output);
         };
 
+        /// https://github.com/CesiumGS/3d-tiles/blob/1.0/specification/TileFormats/PointCloud
+        ///
+        /// A .pnts feature table. Positions are either FLOAT32 VEC3 or, when
+        /// POSITION_QUANTIZED is used, UINT16 VEC3 that must be scaled by
+        /// QUANTIZED_VOLUME_SCALE/65535 and offset by QUANTIZED_VOLUME_OFFSET.
+        ///
+        /// Colour has four spellings and a file may use any one of them:
+        /// RGBA (ubyte x4), RGB (ubyte x3), RGB565 (a single uint16 with 5/6/5
+        /// bit channels) or the global CONSTANT_RGBA. A reader that handles
+        /// only RGBA silently renders most real point clouds black.
+        struct VSGXCHANGE_DECLSPEC pnts_FeatureTable : public vsg::Inherit<gltf::ExtensionsExtras, pnts_FeatureTable>
+        {
+            // storage for binary section
+            vsg::ref_ptr<vsg::ubyteArray> binary;
+
+            uint32_t POINTS_LENGTH = 0;
+            uint32_t BATCH_LENGTH = 0;
+
+            ArraySchema<float> POSITION;
+            ArraySchema<uint16_t> POSITION_QUANTIZED;
+            ArraySchema<uint8_t> RGBA;
+            ArraySchema<uint8_t> RGB;
+            ArraySchema<uint16_t> RGB565;
+            ArraySchema<uint8_t> CONSTANT_RGBA;
+            ArraySchema<float> NORMAL;
+            ArraySchema<uint8_t> NORMAL_OCT16P;
+            ArraySchema<float> RTC_CENTER;
+            ArraySchema<float> QUANTIZED_VOLUME_OFFSET;
+            ArraySchema<float> QUANTIZED_VOLUME_SCALE;
+
+            void read_array(vsg::JSONParser& parser, const std::string_view& property) override;
+            void read_object(vsg::JSONParser& parser, const std::string_view& property) override;
+            void read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input) override;
+
+            void convert();
+
+            void report(vsg::LogOutput& output);
+        };
+
         struct BatchTable;
 
         struct VSGXCHANGE_DECLSPEC Batch : public vsg::Inherit<vsg::JSONtoMetaDataSchema, Batch>
