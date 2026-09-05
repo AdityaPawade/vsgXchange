@@ -1002,6 +1002,38 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
             assignArray(*meshExtras.instancedAttributes, VK_VERTEX_INPUT_RATE_INSTANCE, "TRANSLATION");
             assignArray(*meshExtras.instancedAttributes, VK_VERTEX_INPUT_RATE_INSTANCE, "ROTATION");
             assignArray(*meshExtras.instancedAttributes, VK_VERTEX_INPUT_RATE_INSTANCE, "SCALE");
+
+            // The front face is PIPELINE state, so every instance in this draw
+            // shares one winding. A per-instance SCALE whose components multiply
+            // to a negative number mirrors that instance on its own, and no
+            // single choice of front face can be right for both signs at once --
+            // the ones on the wrong side get inverted gl_FrontFacing, inverted
+            // culling, and a flipped normal under two-sided lighting.
+            //
+            // Fixing it needs the draw split into positive- and negative-handed
+            // batches, which is a larger change than the node-level winding this
+            // reader now implements. Say so rather than rendering it wrongly in
+            // silence; 3D Tiles i3dm content in the wild is uniformly one sign.
+            if (auto scale_itr = meshExtras.instancedAttributes->values.find("SCALE");
+                scale_itr != meshExtras.instancedAttributes->values.end())
+            {
+                if (auto scales = vsg_accessors[scale_itr->second.value].cast<vsg::vec3Array>())
+                {
+                    bool anyPositive = false, anyNegative = false;
+                    for (auto& s : *scales)
+                    {
+                        if (s.x * s.y * s.z < 0.0f) anyNegative = true;
+                        else anyPositive = true;
+                    }
+                    if (anyNegative && anyPositive)
+                    {
+                        vsg::warn("EXT_mesh_gpu_instancing: instances of this mesh have "
+                                  "both mirrored and unmirrored SCALE. They share one "
+                                  "graphics pipeline, so one group will draw with the "
+                                  "wrong winding; per-instance winding is not supported.");
+                    }
+                }
+            }
         }
 
         vsg::ref_ptr<vsg::Node> draw;
@@ -1108,19 +1140,32 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
             VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
             bool blending = false;
             bool two_sided = false;
+            bool mirrored = false;
 
-            SetPipelineStates(VkPrimitiveTopology in_topology, bool in_blending, bool in_two_sided) :
-                topology(in_topology), blending(in_blending), two_sided(in_two_sided) {}
+            SetPipelineStates(VkPrimitiveTopology in_topology, bool in_blending, bool in_two_sided, bool in_mirrored) :
+                topology(in_topology), blending(in_blending), two_sided(in_two_sided), mirrored(in_mirrored) {}
 
             void apply(vsg::Object& object) { object.traverse(*this); }
             void apply(vsg::RasterizationState& rs)
             {
                 if (two_sided) rs.cullMode = VK_CULL_MODE_NONE;
+
+                // glTF 2.0 section 3.7.2.1: when the determinant of the node's
+                // global transform is negative the winding order of the triangle
+                // faces is reversed, so the front face becomes clockwise. This is
+                // the remedy the reference implementations use -- CesiumJS swaps
+                // renderState.cull.face on the determinant sign, and
+                // cesium-unreal sets FMeshBatch::ReverseCulling from
+                // IsLocalToWorldDeterminantNegative(). Neither rewrites the
+                // geometry, which matters here: 3D Tiles content is routinely
+                // Draco-compressed, and those indices cannot be reordered
+                // without decoding and re-encoding the mesh.
+                if (mirrored) rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
             }
             void apply(vsg::InputAssemblyState& ias) { ias.topology = topology; }
             void apply(vsg::ColorBlendState& cbs) { cbs.configureAttachments(blending); }
 
-        } sps(topologyLookup[primitive->mode], vsg_material->blending, vsg_material->two_sided);
+        } sps(topologyLookup[primitive->mode], vsg_material->blending, vsg_material->two_sided, meshExtras.mirrored);
 
         config->accept(sps);
 
@@ -1428,7 +1473,77 @@ vsg::ref_ptr<vsg::Animation> gltf::SceneGraphBuilder::createAnimation(vsg::ref_p
     return vsg_animation;
 }
 
-vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createNode(vsg::ref_ptr<gltf::Node> gltf_node, bool jointNode)
+void gltf::SceneGraphBuilder::computeMirroredNodes()
+{
+    const size_t numNodes = model->nodes.values.size();
+    node_mirrored.assign(numNodes, false);
+    if (numNodes == 0) return;
+
+    // Does a node's OWN transform mirror? A matrix does when the determinant of
+    // its upper-left 3x3 is negative. A TRS does when the product of the scale
+    // components is: a rotation is a unit quaternion and a translation is a
+    // shear-free offset, so neither can change the sign.
+    auto localMirrors = [](const gltf::Node& node) -> bool {
+        const auto& m = node.matrix.values;
+        if (m.size() >= 16)
+        {
+            // glTF matrices are column-major, so m[0..2] is the first column.
+            double det = m[0] * (m[5] * m[10] - m[6] * m[9]) -
+                         m[4] * (m[1] * m[10] - m[2] * m[9]) +
+                         m[8] * (m[1] * m[6] - m[2] * m[5]);
+            return det < 0.0;
+        }
+
+        const auto& s = node.scale.values;
+        if (s.size() >= 3) return (s[0] * s[1] * s[2]) < 0.0;
+
+        return false;
+    };
+
+    // Walk down from each root, iteratively. `visited` doubles as a cycle guard:
+    // the specification forbids a cycle in `children`, but a reader that
+    // recurses on trust hangs on a malformed file rather than reporting it.
+    std::vector<bool> visited(numNodes, false);
+    std::vector<std::pair<size_t, bool>> stack;
+
+    auto walk = [&](size_t root) {
+        stack.clear();
+        stack.push_back({root, false});
+        while (!stack.empty())
+        {
+            size_t ni = stack.back().first;
+            bool parentMirrors = stack.back().second;
+            stack.pop_back();
+
+            if (ni >= numNodes || visited[ni]) continue;
+            visited[ni] = true;
+
+            auto& node = model->nodes.values[ni];
+            if (!node) continue;
+
+            // Exclusive-or and not "or": two mirrors cancel to a rotation.
+            bool mirrors = (parentMirrors != localMirrors(*node));
+            node_mirrored[ni] = mirrors;
+
+            for (auto& id : node->children.values) stack.push_back({id.value, mirrors});
+        }
+    };
+
+    for (auto& gltf_scene : model->scenes.values)
+    {
+        if (!gltf_scene) continue;
+        for (auto& id : gltf_scene->nodes.values) walk(id.value);
+    }
+
+    // A node that no scene reaches is still built by the caller's loop, so give
+    // it a defined answer rather than leaving the vector half filled.
+    for (size_t ni = 0; ni < numNodes; ++ni)
+    {
+        if (!visited[ni]) walk(ni);
+    }
+}
+
+vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createNode(vsg::ref_ptr<gltf::Node> gltf_node, bool jointNode, bool mirrored)
 {
     vsg::ref_ptr<vsg::Node> vsg_node;
 
@@ -1452,7 +1567,11 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createNode(vsg::ref_ptr<gltf::N
     vsg::ref_ptr<vsg::Node> vsg_mesh;
     if (gltf_node->mesh)
     {
-        vsg_mesh = vsg_meshes[gltf_node->mesh.value];
+        // A mirrored node needs its own build of the mesh: the front face is
+        // pipeline state, so the two windings cannot share one instance.
+        meshExtras.mirrored = mirrored;
+        auto& mesh_cache = mirrored ? vsg_meshes_mirrored : vsg_meshes;
+
         auto gltf_mesh = model->meshes.values[gltf_node->mesh.value];
 
         if (auto mesh_gpu_instancing = gltf_node->extension<EXT_mesh_gpu_instancing>("EXT_mesh_gpu_instancing"))
@@ -1460,12 +1579,12 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createNode(vsg::ref_ptr<gltf::N
             meshExtras.instancedAttributes = mesh_gpu_instancing->attributes;
         }
 
-        if (!vsg_meshes[gltf_node->mesh.value])
+        if (!mesh_cache[gltf_node->mesh.value])
         {
-            vsg_meshes[gltf_node->mesh.value] = createMesh(gltf_mesh, meshExtras);
+            mesh_cache[gltf_node->mesh.value] = createMesh(gltf_mesh, meshExtras);
         }
 
-        vsg_mesh = vsg_meshes[gltf_node->mesh.value];
+        vsg_mesh = mesh_cache[gltf_node->mesh.value];
     }
 
     bool isTransform = !(gltf_node->matrix.values.empty()) ||
@@ -1971,6 +2090,22 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
         vsg_accessors[ai] = createAccessor(model->accessors.values[ai]);
     }
 
+    // Which nodes mirror? glTF 2.0 (3.7.2.1) asks for the determinant of each
+    // node's GLOBAL transform, but nodes are built further down in a flat loop
+    // that has no parent on hand to ask, so accumulate the sign here, walking
+    // down from the scene roots.
+    //
+    // THE POSITION OF THIS CALL IS THE WHOLE POINT. flattenTransforms(), just
+    // below, bakes each node's transform into its vertex positions and then
+    // CLEARS matrix/rotation/scale/translation. Run after it, this pre-pass sees
+    // a tree with no transforms left in it and concludes that nothing mirrors --
+    // and since i3dm.cpp sets instanceNodeHint for every instanced 3D Tiles
+    // payload, that is precisely the content the rule is needed for. Baking a
+    // reflection into the vertices reverses the winding just as surely as
+    // applying it at draw time does, so the flag is right either way; it just
+    // has to be read before the evidence is erased.
+    computeMirroredNodes();
+
     if (instanceNodeHint != vsg::Options::INSTANCE_NONE)
     {
         requiresRootTransformNode = false;
@@ -2055,6 +2190,7 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
     // vsg::info("create meshes = ", model->meshes.values.size());
     // populate vsg_meshes in the createNode method.
     vsg_meshes.resize(model->meshes.values.size());
+    vsg_meshes_mirrored.resize(model->meshes.values.size());
 
     if (auto khr_lights = model->extension<KHR_lights_punctual>("KHR_lights_punctual"))
     {
@@ -2103,7 +2239,7 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
     vsg_nodes.resize(model->nodes.values.size());
     for (size_t ni = 0; ni < model->nodes.values.size(); ++ni)
     {
-        vsg_nodes[ni] = createNode(model->nodes.values[ni], vsg_joints[ni]);
+        vsg_nodes[ni] = createNode(model->nodes.values[ni], vsg_joints[ni], node_mirrored[ni]);
     }
 
     for (size_t ni = 0; ni < model->nodes.values.size(); ++ni)

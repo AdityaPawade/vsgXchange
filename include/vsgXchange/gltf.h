@@ -672,6 +672,18 @@ namespace vsgXchange
             std::vector<SamplerImage> vsg_textures;
             std::vector<vsg::ref_ptr<vsg::DescriptorConfigurator>> vsg_materials;
             std::vector<vsg::ref_ptr<vsg::Node>> vsg_meshes;
+
+            /// The same meshes as built for mirrored nodes. Two caches and not
+            /// one, because the winding is baked into the graphics pipeline: a
+            /// mesh referenced by both a mirrored and an unmirrored node needs
+            /// one of each, and sharing a single instance would give whichever
+            /// node was built second the wrong front face.
+            std::vector<vsg::ref_ptr<vsg::Node>> vsg_meshes_mirrored;
+
+            /// Per node index, whether its ACCUMULATED transform mirrors.
+            /// Filled by computeMirroredNodes() before any node is built,
+            /// because nodes are created in a flat loop with no parent on hand.
+            std::vector<bool> node_mirrored;
             std::vector<vsg::ref_ptr<vsg::Light>> vsg_lights;
             std::vector<vsg::ref_ptr<vsg::Node>> vsg_nodes;
             std::vector<vsg::ref_ptr<vsg::Node>> vsg_scenes;
@@ -682,6 +694,17 @@ namespace vsgXchange
             {
                 vsg::ref_ptr<gltf::Attributes> instancedAttributes;
                 vsg::ref_ptr<vsg::JointSampler> jointSampler;
+
+                /// True when the node this mesh hangs under has a negative
+                /// determinant -- a mirror. glTF 2.0 (3.7.2.1) makes the
+                /// determinant of a node's GLOBAL transform decide the winding
+                /// order: positive means counter-clockwise, negative means
+                /// clockwise. Drawing a mirrored node with the default
+                /// counter-clockwise front face inverts gl_FrontFacing, which
+                /// inverts back-face culling and, for a doubleSided material,
+                /// flips the shading normal the wrong way -- up-facing surfaces
+                /// then shade as though they face down.
+                bool mirrored = false;
             };
 
             vsg::ref_ptr<vsg::DescriptorConfigurator> default_material;
@@ -711,7 +734,25 @@ namespace vsgXchange
             vsg::ref_ptr<vsg::DescriptorConfigurator> createMaterial(vsg::ref_ptr<gltf::Material> gltf_material);
             vsg::ref_ptr<vsg::Node> createMesh(vsg::ref_ptr<gltf::Mesh> gltf_mesh, const MeshExtras& extras = {});
             vsg::ref_ptr<vsg::Light> createLight(vsg::ref_ptr<gltf::Light> gltf_light);
-            vsg::ref_ptr<vsg::Node> createNode(vsg::ref_ptr<gltf::Node> gltf_node, bool jointNode);
+            vsg::ref_ptr<vsg::Node> createNode(vsg::ref_ptr<gltf::Node> gltf_node, bool jointNode, bool mirrored = false);
+
+            /// Fill node_mirrored: for each node, whether the determinant of its
+            /// accumulated transform is negative. Public so it can be tested
+            /// without building a whole scene.
+            ///
+            /// Runs ONCE, at scene construction, and the winding it decides is
+            /// baked into the graphics pipeline. Two consequences worth knowing:
+            ///
+            ///  - An ANIMATED scale that crosses zero determinant -- keyframes
+            ///    at [1,1,1] and [-1,1,1], say -- gets the winding of its
+            ///    initial pose and keeps it. At the opposite keyframe the
+            ///    facing, the culling and the two-sided normal flip are all
+            ///    inverted. Per-frame winding would need a runtime choice
+            ///    between two pipelines, which this does not attempt.
+            ///  - Per-INSTANCE mirroring under EXT_mesh_gpu_instancing is not
+            ///    covered either, for the same reason: one pipeline, one front
+            ///    face. createMesh warns when it sees mixed signs.
+            void computeMirroredNodes();
             vsg::ref_ptr<vsg::Animation> createAnimation(vsg::ref_ptr<gltf::Animation> gltf_animation);
             vsg::ref_ptr<vsg::Node> createScene(vsg::ref_ptr<gltf::Scene> gltf_scene, bool requiresRootTransformNode, const vsg::dmat4& matrix);
 
