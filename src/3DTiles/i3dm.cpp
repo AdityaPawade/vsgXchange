@@ -125,15 +125,22 @@ void Tiles3D::i3dm_FeatureTable::convert()
 
     if (INSTANCES_LENGTH == 0 || !binary) return;
 
-    POSITION.assign(*binary, 3 * INSTANCES_LENGTH);
-    POSITION_QUANTIZED.assign(*binary, 3 * INSTANCES_LENGTH);
-    NORMAL_UP.assign(*binary, 3 * INSTANCES_LENGTH);
-    NORMAL_RIGHT.assign(*binary, 3 * INSTANCES_LENGTH);
-    NORMAL_UP_OCT32P.assign(*binary, 2 * INSTANCES_LENGTH);
-    NORMAL_RIGHT_OCT32P.assign(*binary, 2 * INSTANCES_LENGTH);
-    SCALE.assign(*binary, INSTANCES_LENGTH);
-    SCALE_NON_UNIFORM.assign(*binary, 3 * INSTANCES_LENGTH);
-    BATCH_ID.assign(*binary, INSTANCES_LENGTH);
+    // size_t, not uint32_t. INSTANCES_LENGTH comes from the file and
+    // `3 * INSTANCES_LENGTH` in 32-bit arithmetic WRAPS: 1431655766 gives 2.
+    // assign() would then read two floats -- a read that is genuinely in
+    // bounds, so no bounds check can catch it -- and every consumer would go on
+    // believing it had INSTANCES_LENGTH instances. Widening here is what makes
+    // the length implausible enough for assign() to reject.
+    const size_t N = static_cast<size_t>(INSTANCES_LENGTH);
+    POSITION.assign(*binary, 3 * N);
+    POSITION_QUANTIZED.assign(*binary, 3 * N);
+    NORMAL_UP.assign(*binary, 3 * N);
+    NORMAL_RIGHT.assign(*binary, 3 * N);
+    NORMAL_UP_OCT32P.assign(*binary, 2 * N);
+    NORMAL_RIGHT_OCT32P.assign(*binary, 2 * N);
+    SCALE.assign(*binary, N);
+    SCALE_NON_UNIFORM.assign(*binary, 3 * N);
+    BATCH_ID.assign(*binary, N);
     RTC_CENTER.assign(*binary, 3);
     QUANTIZED_VOLUME_OFFSET.assign(*binary, 3);
     QUANTIZED_VOLUME_SCALE.assign(*binary, 3);

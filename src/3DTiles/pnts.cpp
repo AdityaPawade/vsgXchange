@@ -73,7 +73,12 @@ void Tiles3D::pnts_FeatureTable::convert()
 {
     if (POINTS_LENGTH == 0 || !binary) return;
 
-    const uint32_t N = POINTS_LENGTH;
+    // size_t, not uint32_t. POINTS_LENGTH comes from the file, and `3 * N` in
+    // 32-bit arithmetic WRAPS: N = 1431655766 makes 3*N == 2. assign() would
+    // then load two floats, the `values.size() >= N * 3` guard below would
+    // compare against the same wrapped 2 and pass, and the bounding-box loop
+    // would still run N times indexing positions[i * 3] far past the end.
+    const size_t N = static_cast<size_t>(POINTS_LENGTH);
     POSITION.assign(*binary, 3 * N);
     POSITION_QUANTIZED.assign(*binary, 3 * N);
     RGBA.assign(*binary, 4 * N);
@@ -128,8 +133,12 @@ namespace
                                const std::vector<uint8_t>& colours,      // 4 per point, normalized
                                const vsg::vec3& bbMin, const vsg::vec3& bbMax)
     {
-        const uint32_t count = static_cast<uint32_t>(positions.size() / 3);
-        const uint32_t posBytes = count * 12;
+        // size_t throughout: count * 16 in 32-bit arithmetic wraps well inside
+        // the range of a declared POINTS_LENGTH, and the code would then append
+        // the wrapped byte count while writing truncated GLB length fields.
+        // read_pnts caps N before calling this, so the casts below are safe.
+        const size_t count = positions.size() / 3;
+        const size_t posBytes = count * 12;
 
 
         // COLOR_0 as FLOAT VEC4, not normalized UNSIGNED_BYTE. The compact
@@ -141,7 +150,7 @@ namespace
         std::vector<float> fcolours;
         fcolours.reserve(colours.size());
         for (uint8_t c : colours) fcolours.push_back(static_cast<float>(c) / 255.0f);
-        const uint32_t colBytesF = count * 16;
+        const size_t colBytesF = count * 16;
 
         std::string bin;
         bin.reserve(posBytes + colBytesF + 4);
@@ -178,7 +187,7 @@ namespace
               "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962}],"
             "\"buffers\":[{\"byteLength\":%u}]}",
             count, bbMin.x, bbMin.y, bbMin.z, bbMax.x, bbMax.y, bbMax.z,
-            count, posBytes, posBytes, colBytesF,
+            (uint32_t)count, (uint32_t)posBytes, (uint32_t)posBytes, (uint32_t)colBytesF,
             static_cast<uint32_t>(bin.size()));
 
         std::string js(json);
@@ -217,6 +226,41 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
     fin.read(reinterpret_cast<char*>(&header), sizeof(Header));
     if (!fin.good() || std::strncmp(header.magic, "pnts", 4) != 0) return {};
 
+    // Validate the declared section lengths against the stream BEFORE using any
+    // of them to size an allocation. Every one of these is attacker-controlled:
+    // a 28-byte file with a valid "pnts" magic and
+    // featureTableJSONByteLength = 0xFFFFFFFF would otherwise ask resize() for
+    // 4 GiB of JSON that does not exist. The sums are done in uint64 because
+    // adding four 32-bit lengths wraps.
+    {
+        const uint64_t sections =
+            static_cast<uint64_t>(header.featureTableJSONByteLength) +
+            header.featureTableBinaryByteLength +
+            header.batchTableJSONByteLength +
+            header.batchTableBinaryLength;
+
+        const std::streampos here = fin.tellg();
+        fin.seekg(0, std::ios::end);
+        const std::streampos endPos = fin.tellg();
+        fin.seekg(here);
+        if (endPos < here) return {};
+        const uint64_t remaining = static_cast<uint64_t>(endPos - here);
+
+        if (sections > remaining)
+        {
+            vsg::warn("Tiles3D::read_pnts(", filename, ") declares ", sections,
+                      " bytes of tables but only ", remaining, " remain.");
+            return {};
+        }
+        if (header.byteLength != 0 &&
+            static_cast<uint64_t>(header.byteLength) < sizeof(Header) + sections)
+        {
+            vsg::warn("Tiles3D::read_pnts(", filename, ") byteLength ",
+                      header.byteLength, " is smaller than its own tables.");
+            return {};
+        }
+    }
+
     vsg::JSONParser parser;
     parser.options = options;
 
@@ -245,10 +289,23 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
         fin.read(skip.data(), skip.size());
     }
 
-    const uint32_t N = featureTable->POINTS_LENGTH;
+    const size_t N = static_cast<size_t>(featureTable->POINTS_LENGTH);
     if (N == 0)
     {
         vsg::warn("Tiles3D::read_pnts(", filename, ") POINTS_LENGTH is 0.");
+        return {};
+    }
+
+    // A declared point count is not a promise that the data exists. The
+    // intermediate glTF holds 12 bytes of position and 16 of colour per point,
+    // and its chunk lengths are 32-bit fields, so beyond this the generated
+    // asset cannot even be described -- let alone allocated. 64M points is
+    // ~1.9 GB of intermediate buffer, already far past anything real.
+    constexpr size_t MAX_POINTS = 64u * 1024u * 1024u;
+    if (N > MAX_POINTS)
+    {
+        vsg::warn("Tiles3D::read_pnts(", filename, ") POINTS_LENGTH ", N,
+                  " exceeds the ", MAX_POINTS, " point limit.");
         return {};
     }
 

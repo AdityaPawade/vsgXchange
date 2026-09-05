@@ -25,6 +25,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <vsg/threading/OperationThreads.h>
 
+#include <cstring>
+#include <limits>
+
 #include <vsgXchange/gltf.h>
 
 namespace vsgXchange
@@ -206,15 +209,39 @@ namespace vsgXchange
                 parser.read_string(ignored);
             }
 
-            void assign(vsg::ubyteArray& binary, uint32_t count)
+            /// Copy `count` values from the feature-table binary at byteOffset.
+            ///
+            /// Everything here comes from the FILE -- byteOffset from its JSON,
+            /// count from a length the file declares -- and a 3D Tiles payload
+            /// is untrusted content fetched over HTTP. This used to compute
+            /// `reinterpret_cast<T*>(binary.data() + byteOffset)` and read
+            /// `count` elements with no validation at all, so
+            ///
+            ///     {"POINTS_LENGTH":1,"POSITION":{"byteOffset":0}}
+            ///
+            /// against a 1-byte binary section read a 4-byte float out of a
+            /// 1-byte allocation, and a byteOffset near UINT32_MAX formed an
+            /// invalid pointer before it was ever dereferenced.
+            ///
+            /// memcpy rather than a typed dereference: byteOffset need not be a
+            /// multiple of sizeof(T), and an unaligned load is undefined
+            /// behaviour, not merely slow.
+            void assign(vsg::ubyteArray& binary, size_t count)
             {
                 if (!values.empty() || byteOffset == invalidOffset) return;
 
-                T* ptr = reinterpret_cast<T*>(binary.data() + byteOffset);
-                for (uint32_t i = 0; i < count; ++i)
-                {
-                    values.push_back(*(ptr++));
-                }
+                const size_t total = binary.size();
+                const size_t offset = static_cast<size_t>(byteOffset);
+                if (offset > total) return;
+
+                // Checked: count * sizeof(T) must fit both in size_t and in
+                // what remains after the offset.
+                if (count > (std::numeric_limits<size_t>::max() / sizeof(T))) return;
+                const size_t bytes = count * sizeof(T);
+                if (bytes > total - offset) return;
+
+                values.resize(count);
+                if (count > 0) std::memcpy(values.data(), binary.data() + offset, bytes);
             }
 
             explicit operator bool() const noexcept { return !values.empty(); }
