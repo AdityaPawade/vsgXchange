@@ -130,12 +130,23 @@ namespace
     {
         const uint32_t count = static_cast<uint32_t>(positions.size() / 3);
         const uint32_t posBytes = count * 12;
-        const uint32_t colBytes = count * 4;
+
+
+        // COLOR_0 as FLOAT VEC4, not normalized UNSIGNED_BYTE. The compact
+        // form is legal glTF and the reader accepts it, but the resulting
+        // ubvec4 vertex buffer rendered every point pure black -- measured,
+        // 20,469 of 20,469 non-background pixels exactly (0,0,0), against a
+        // colour array that held the file's real values. Floats cost 16 bytes
+        // a point instead of 4 and leave nothing to interpret.
+        std::vector<float> fcolours;
+        fcolours.reserve(colours.size());
+        for (uint8_t c : colours) fcolours.push_back(static_cast<float>(c) / 255.0f);
+        const uint32_t colBytesF = count * 16;
 
         std::string bin;
-        bin.reserve(posBytes + colBytes + 4);
+        bin.reserve(posBytes + colBytesF + 4);
         bin.append(reinterpret_cast<const char*>(positions.data()), posBytes);
-        bin.append(reinterpret_cast<const char*>(colours.data()), colBytes);
+        bin.append(reinterpret_cast<const char*>(fcolours.data()), colBytesF);
         while (bin.size() % 4 != 0) bin.push_back('\0');   // chunks are 4-byte aligned
 
         // POSITION accessors REQUIRE min/max; a reader is entitled to reject the
@@ -143,23 +154,31 @@ namespace
         char json[1600];
         std::snprintf(json, sizeof(json),
             "{\"asset\":{\"version\":\"2.0\"},\"scene\":0,"
+            "\"extensionsUsed\":[\"KHR_materials_unlit\"],"
             "\"scenes\":[{\"nodes\":[0]}],"
             "\"nodes\":[{\"mesh\":0,\"name\":\"points\"}],"
             "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"COLOR_0\":1},"
             "\"mode\":0,\"material\":0}]}],"
+            // KHR_materials_unlit, because a point has no surface and therefore
+            // no meaningful normal. Lit, the shader takes whatever the default
+            // normal is and shades every point the same way: the 125,000-point
+            // Cesium sample rendered as a solid BLACK sphere while its colour
+            // array held the file's real values. Unlit passes COLOR_0 straight
+            // through, which is what a point cloud means.
             "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,1,1,1],"
-            "\"metallicFactor\":0,\"roughnessFactor\":1},\"doubleSided\":true}],"
+            "\"metallicFactor\":0,\"roughnessFactor\":1},\"doubleSided\":true,"
+            "\"extensions\":{\"KHR_materials_unlit\":{}}}],"
             "\"accessors\":["
               "{\"bufferView\":0,\"componentType\":5126,\"count\":%u,\"type\":\"VEC3\","
                "\"min\":[%.9g,%.9g,%.9g],\"max\":[%.9g,%.9g,%.9g]},"
-              "{\"bufferView\":1,\"componentType\":5121,\"normalized\":true,"
+              "{\"bufferView\":1,\"componentType\":5126,"
                "\"count\":%u,\"type\":\"VEC4\"}],"
             "\"bufferViews\":["
               "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":%u,\"target\":34962},"
               "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962}],"
             "\"buffers\":[{\"byteLength\":%u}]}",
             count, bbMin.x, bbMin.y, bbMin.z, bbMax.x, bbMax.y, bbMax.z,
-            count, posBytes, posBytes, colBytes,
+            count, posBytes, posBytes, colBytesF,
             static_cast<uint32_t>(bin.size()));
 
         std::string js(json);
