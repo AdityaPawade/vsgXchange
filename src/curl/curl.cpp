@@ -234,9 +234,29 @@ vsg::ref_ptr<vsg::Object> curl::Implementation::read(const vsg::Path& filename, 
             // success
             auto local_options = vsg::clone(options);
             local_options->paths.insert(local_options->paths.begin(), vsg::filePath(filename));
-            if (!local_options->extensionHint)
+
+            // The URL's own extension wins over an inherited hint.
+            //
+            // extensionHint exists to type a stream that has no filename. Here
+            // there IS one, and it describes THIS resource; a hint reaching us
+            // from a caller describes the document that referenced it. Keeping
+            // the hint meant a .gltf fetched over http had its sibling .bin
+            // buffers fetched successfully and then handed to the glTF reader,
+            // which reported "Unable to open file" for a request that returned
+            // 200. The symptom was a tile that drew nothing, with eight "no
+            // vsg::Data available to create BufferView" lines and no failed
+            // request anywhere to point at.
+            //
+            // A hint still applies when the URL says nothing -- a
+            // template-expanded content address with no extension, which is
+            // ordinary in 3D Tiles.
+            if (auto ext = vsg::lowerCaseFileExtension(filename); ext)
             {
-                local_options->extensionHint = vsg::lowerCaseFileExtension(filename);
+                local_options->extensionHint = ext;
+            }
+            else if (!local_options->extensionHint)
+            {
+                local_options->extensionHint = ext;
             }
 
             object = vsg::read(sstr, local_options);
