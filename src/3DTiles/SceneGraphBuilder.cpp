@@ -88,7 +88,14 @@ vsg::dsphere Tiles3D::SceneGraphBuilder::createBound(vsg::ref_ptr<BoundingVolume
         }
         else if (boundingVolume->sphere.values.size() == 4)
         {
-            const auto& v = boundingVolume->box.values;
+            // sphere.values, not box.values. The guard above tests `sphere`
+            // and this line used to read `box`, which for a sphere-only
+            // bounding volume is EMPTY -- so v[0] indexed past the end of a
+            // zero-length vector and the reader segfaulted. Any tileset using
+            // the third of the spec's three bounding volume types took the
+            // process down, with no message; the official Cesium sample
+            // 1.0/TilesetWithRequestVolume is one.
+            const auto& v = boundingVolume->sphere.values;
             return vsg::dsphere(v[0], v[1], v[2], v[3]);
         }
         else
