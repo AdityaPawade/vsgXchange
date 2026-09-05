@@ -103,6 +103,42 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_b3dm(std::istream& fin, vsg::ref_ptr<con
         return {};
     }
 
+    // The four table lengths and byteLength all come from the file.
+    //
+    // Summed in 32-bit they WRAP, and `byteLength - sizeof(Header) - sections`
+    // then underflows into about four gigabytes, which is passed straight to
+    // resize(). Checked in 64-bit against what is actually left in the stream,
+    // before any of them is used as a size.
+    {
+        const uint64_t sections =
+            static_cast<uint64_t>(header.featureTableJSONByteLength) +
+            header.featureTableBinaryByteLength +
+            header.batchTableJSONByteLength +
+            header.batchTableBinaryLength;
+
+        const std::streampos here = fin.tellg();
+        fin.seekg(0, std::ios::end);
+        const std::streampos endPos = fin.tellg();
+        fin.seekg(here);
+        if (endPos < here) return {};
+        const uint64_t remaining = static_cast<uint64_t>(endPos - here);
+
+        if (sections > remaining)
+        {
+            vsg::warn("Tiles3D::read_b3dm(", filename, ") declares ", sections,
+                      " bytes of tables but only ", remaining, " remain.");
+            return {};
+        }
+
+        if (header.byteLength != 0 &&
+            static_cast<uint64_t>(header.byteLength) < sizeof(Header) + sections)
+        {
+            vsg::warn("Tiles3D::read_b3dm(", filename, ") byteLength ",
+                      header.byteLength, " is smaller than its own tables.");
+            return {};
+        }
+    }
+
     // Feature table
     // Batch table
     // Binary glTF
