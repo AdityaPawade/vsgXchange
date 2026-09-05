@@ -182,6 +182,30 @@ namespace vsgXchange
                     parser.warning();
             }
 
+            /// Consume and discard "componentType" and "type".
+            ///
+            /// This override looks pointless -- the value is thrown away and T
+            /// is already fixed by the schema -- and it is load-bearing. A
+            /// feature-table semantic is written
+            ///
+            ///     "NORMAL_UP":{"byteOffset":12000,"componentType":"FLOAT","type":"VEC3"}
+            ///
+            /// and without a read_string here the base Schema never advances
+            /// past the "FLOAT", so the parser loses its place and EVERY
+            /// property after the first one is silently dropped. The failure is
+            /// invisible: POSITION parses (its byteOffset precedes the first
+            /// string), so instances are positioned correctly, while NORMAL_UP,
+            /// NORMAL_RIGHT and SCALE_NON_UNIFORM keep byteOffset == invalid,
+            /// assign() returns early, and every instance falls back to an
+            /// identity rotation and unit scale. A city of instanced wall
+            /// panels then renders as a flat carpet of horizontal slabs with no
+            /// error, no warning, and correct-looking geometry everywhere else.
+            void read_string(vsg::JSONParser& parser, const std::string_view&) override
+            {
+                std::string ignored;
+                parser.read_string(ignored);
+            }
+
             void assign(vsg::ubyteArray& binary, uint32_t count)
             {
                 if (!values.empty() || byteOffset == invalidOffset) return;

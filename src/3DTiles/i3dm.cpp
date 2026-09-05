@@ -21,6 +21,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include <vsg/threading/OperationThreads.h>
 #include <vsg/ui/UIEvent.h>
 #include <vsg/utils/CommandLine.h>
+
+#include <cstdio>
+#include <cstdlib>
 #include <vsg/utils/ComputeBounds.h>
 
 #include <fstream>
@@ -110,6 +113,16 @@ void Tiles3D::i3dm_FeatureTable::read_bool(vsg::JSONParser& parser, const std::s
 
 void Tiles3D::i3dm_FeatureTable::convert()
 {
+    if (const char* dbg = std::getenv("I3DM_DEBUG"); dbg && *dbg)
+    {
+        std::fprintf(stderr,
+            "[i3dm] INSTANCES_LENGTH=%u binary=%zu bytes | byteOffsets: "
+            "POSITION=%u NORMAL_UP=%u NORMAL_RIGHT=%u SCALE_NON_UNIFORM=%u\n",
+            INSTANCES_LENGTH, binary ? binary->size() : 0u,
+            POSITION.byteOffset, NORMAL_UP.byteOffset,
+            NORMAL_RIGHT.byteOffset, SCALE_NON_UNIFORM.byteOffset);
+    }
+
     if (INSTANCES_LENGTH == 0 || !binary) return;
 
     POSITION.assign(*binary, 3 * INSTANCES_LENGTH);
@@ -298,14 +311,34 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_i3dm(std::istream& fin, vsg::ref_ptr<con
             translation = quantizeOffset + quantizedPosition * quantizeScale;
         }
 
-        vsg::dvec3 normal_up(0.0, 0.0, 1.0);
+        // NOTE ON NAMING, because it is the whole bug this code once had.
+        //
+        // i3dm's NORMAL_UP is NOT the instance's up axis. NORMAL_UP and
+        // NORMAL_RIGHT are two axes of the instance's frame, and the third --
+        // cross(NORMAL_RIGHT, NORMAL_UP) -- is what ends up vertical. See
+        // cesium-native, I3dmToGltfConverter.cpp `rotationFromUpRight`:
+        //
+        //     forward = cross(right, up);
+        //     mat3x3(right, up, forward);      // columns: X, Y, Z
+        //
+        // so NORMAL_UP fills the Y column and the cross fills Z. Its own
+        // EAST_NORTH_UP fallback confirms the reading: it passes up=North and
+        // right=East, giving X=East, Y=North, Z=cross(East,North)=Up.
+        //
+        // Getting this wrong is not subtle in the output and is completely
+        // silent in the code. With NORMAL_UP in the Z column instead, every
+        // wall panel in a city tileset was laid flat on its back facing the
+        // sky, while CesiumJS drew the same bytes as upright buildings.
+        //
+        // Identity default, so a tileset with neither semantic is unrotated.
+        vsg::dvec3 normal_up(0.0, 1.0, 0.0);
         vsg::dvec3 normal_right(1.0, 0.0, 0.0);
 
         if (featureTable->EAST_NORTH_UP)
         {
             const double epsilon = 1e-7;
 
-            normal_up = vsg::normalize(translation);
+            const vsg::dvec3 geodetic_up = vsg::normalize(translation);
             normal_right.set(-translation.y, translation.x, 0.0);
             double len = vsg::length(normal_right);
             if (len > epsilon)
@@ -316,6 +349,9 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_i3dm(std::istream& fin, vsg::ref_ptr<con
             {
                 normal_right.set(0.0, 1.0, 0.0);
             }
+            // North, not Up. cross(right, north) is then the geodetic up and
+            // lands in the Z column, which is what makes the instance stand.
+            normal_up = vsg::cross(geodetic_up, normal_right);
         }
 
         if (featureTable->NORMAL_UP && i * 3 < featureTable->NORMAL_UP.values.size())
@@ -355,11 +391,13 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_i3dm(std::istream& fin, vsg::ref_ptr<con
             scale.set(1.0, 1.0, 1.0);
         }
 
-        vsg::dvec3 normal_forward = vsg::cross(normal_up, normal_right);
+        // Column order and cross operands both match cesium-native exactly; see
+        // the note above. Reversing either one lays every instance on its side.
+        vsg::dvec3 normal_forward = vsg::cross(normal_right, normal_up);
 
         vsg::dmat4 rot_matrix(normal_right.x, normal_right.y, normal_right.z, 0.0,
-                              normal_forward.x, normal_forward.y, normal_forward.z, 0.0,
                               normal_up.x, normal_up.y, normal_up.z, 0.0,
+                              normal_forward.x, normal_forward.y, normal_forward.z, 0.0,
                               0.0, 0.0, 0.0, 1.0);
 
         vsg::dvec3 temp_translation, temp_scale;
