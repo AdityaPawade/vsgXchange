@@ -17,6 +17,13 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include <vsg/io/read.h>
 #include <vsg/nodes/MatrixTransform.h>
 
+#include <vsgXchange/Version.h>
+
+#ifdef vsgXchange_draco
+#    include <draco/compression/decode.h>
+#    include <draco/point_cloud/point_cloud.h>
+#endif
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -126,6 +133,91 @@ void Tiles3D::pnts_FeatureTable::report(vsg::LogOutput& output)
     if (NORMAL) output("    NORMAL ", NORMAL.values);
     if (RTC_CENTER) output("    RTC_CENTER ", RTC_CENTER.values);
     output("}");
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// 3DTILES_draco_point_compression
+//
+void Tiles3D::draco_point_compression::report(vsg::LogOutput& output)
+{
+    output.enter("3DTILES_draco_point_compression {");
+    output("byteOffset = ", byteOffset);
+    output("byteLength = ", byteLength);
+    output.enter("properties = {");
+    for (auto& [semantic, id] : properties.values) output("    ", semantic, ", ", id);
+    output.leave();
+    output.leave();
+}
+
+void Tiles3D::draco_point_compression::read_object(vsg::JSONParser& parser, const std::string_view& property)
+{
+    if (property == "properties")
+        parser.read_object(properties);
+    else
+        gltf::ExtensionsExtras::read_object(parser, property);
+}
+
+void Tiles3D::draco_point_compression::read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input)
+{
+    if (property == "byteOffset") input >> byteOffset;
+    else if (property == "byteLength") input >> byteLength;
+    else parser.warning();
+}
+
+namespace
+{
+#ifdef vsgXchange_draco
+    //! Read one Draco attribute out as `components` floats per point.
+    //!
+    //! ConvertValue does the work of getting from whatever the attribute is
+    //! stored as -- quantised integers, usually -- to float, which is what the
+    //! generated glTF wants for POSITION and NORMAL alike.
+    bool dracoToFloats(const draco::PointCloud& pc, uint32_t uniqueId,
+                       size_t count, unsigned components, std::vector<float>& out)
+    {
+        const draco::PointAttribute* attr = pc.GetAttributeByUniqueId(uniqueId);
+        if (!attr) return false;
+
+        // The blob decides how many components it stored. Asking for more than
+        // it has reads past the end of its value; fewer is a different
+        // semantic. Either way it is not the attribute we were promised.
+        if (attr->num_components() != components) return false;
+
+        out.assign(count * components, 0.0f);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const auto index = attr->mapped_index(draco::PointIndex(static_cast<uint32_t>(i)));
+            if (!attr->ConvertValue(index, static_cast<int8_t>(components),
+                                    out.data() + i * components))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    //! The same, as bytes -- for RGB and RGBA, which are normalized u8.
+    bool dracoToBytes(const draco::PointCloud& pc, uint32_t uniqueId,
+                      size_t count, unsigned components, std::vector<uint8_t>& out)
+    {
+        const draco::PointAttribute* attr = pc.GetAttributeByUniqueId(uniqueId);
+        if (!attr) return false;
+        if (attr->num_components() != components) return false;
+
+        out.assign(count * components, 0u);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const auto index = attr->mapped_index(draco::PointIndex(static_cast<uint32_t>(i)));
+            if (!attr->ConvertValue(index, static_cast<int8_t>(components),
+                                    out.data() + i * components))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -339,6 +431,11 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
     vsg::JSONParser parser;
     parser.options = options;
 
+    // Without this the extension is stored as anonymous metadata and its
+    // properties map -- the semantic-to-attribute-id table the decode needs --
+    // is not reachable.
+    parser.setObject("3DTILES_draco_point_compression", draco_point_compression::create());
+
     auto featureTable = pnts_FeatureTable::create();
     if (header.featureTableJSONByteLength > 0)
     {
@@ -364,28 +461,6 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
         fin.read(skip.data(), skip.size());
     }
 
-    // Draco: refuse the file rather than decode it wrongly.
-    //
-    // 3DTILES_draco_point_compression puts every attribute in one compressed
-    // blob, and the feature table still lists POSITION, RGB and NORMAL -- all
-    // with byteOffset 0, all pointing at the head of that blob. Nothing in the
-    // rest of this function can tell that apart from three real semantics, so
-    // without this check the reader hands the compressed bytes to the
-    // bounding-box loop and produces a cloud whose extent came out
-    // [-1.5e+13, 3.4e+28] for a scene that fits in a 5-metre box.
-    //
-    // That is the worse failure. This check exists because a fix elsewhere --
-    // consuming unrecognised JSON objects instead of letting them desync the
-    // parser -- turned these three corpus files from "POINTS_LENGTH is 0" into
-    // silently converting garbage.
-    if (featureTable->extensions &&
-        featureTable->extensions->values.count("3DTILES_draco_point_compression") > 0)
-    {
-        vsg::warn("Tiles3D::read_pnts(", filename, ") uses "
-                  "3DTILES_draco_point_compression, which is not supported.");
-        return {};
-    }
-
     const size_t N = static_cast<size_t>(featureTable->POINTS_LENGTH);
     if (N == 0)
     {
@@ -406,11 +481,118 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
         return {};
     }
 
+    // ---- Draco -----------------------------------------------------------
+    //
+    // 3DTILES_draco_point_compression puts every attribute in one compressed
+    // blob and STILL lists POSITION, RGB and NORMAL in the feature table, each
+    // with byteOffset 0 -- they all point at the head of the blob. So this has
+    // to be decided BEFORE the semantics are read: reading them as written
+    // produced a cloud whose extent came out [-1.5e+13, 3.4e+28] for a scene
+    // that fits in a 5-metre box.
+    std::vector<float> dracoPositions;
+    std::vector<uint8_t> dracoColours;      // RGB or RGBA, 3 or 4 per point
+    unsigned dracoColourComponents = 0;
+    std::vector<float> dracoNormals;
+    bool dracoDecoded = false;
+
+    if (auto compression = featureTable->extension<draco_point_compression>(
+            "3DTILES_draco_point_compression"))
+    {
+#ifdef vsgXchange_draco
+        // The blob's extent comes from the file. Check it against the binary
+        // section actually read before handing a pointer and a length to a
+        // decoder that will trust both.
+        const size_t binarySize = featureTable->binary ? featureTable->binary->size() : 0;
+        const size_t offset = compression->byteOffset;
+        const size_t length = compression->byteLength;
+
+        if (length == 0 || offset > binarySize || length > binarySize - offset)
+        {
+            vsg::warn("Tiles3D::read_pnts(", filename, ") Draco blob at ", offset,
+                      "+", length, " does not fit the ", binarySize,
+                      " byte feature table binary.");
+            return {};
+        }
+
+        draco::DecoderBuffer decodeBuffer;
+        decodeBuffer.Init(
+            reinterpret_cast<const char*>(featureTable->binary->dataPointer()) + offset,
+            length);
+
+        draco::Decoder decoder;
+        auto decoded = decoder.DecodePointCloudFromBuffer(&decodeBuffer);
+        if (!decoded.ok())
+        {
+            vsg::warn("Tiles3D::read_pnts(", filename, ") Draco decode failed: ",
+                      decoded.status().error_msg_string());
+            return {};
+        }
+
+        const auto& cloud = *decoded.value();
+
+        // The point count in the blob is the authority: POINTS_LENGTH is a
+        // second, independent statement of the same number, and if the two
+        // disagree the file is describing something that is not there.
+        if (static_cast<size_t>(cloud.num_points()) != N)
+        {
+            vsg::warn("Tiles3D::read_pnts(", filename, ") POINTS_LENGTH is ", N,
+                      " but the Draco blob holds ", cloud.num_points(), " points.");
+            return {};
+        }
+
+        const auto& props = compression->properties.values;
+
+        auto idOf = [&](const char* semantic, uint32_t& out) -> bool
+        {
+            auto i = props.find(semantic);
+            if (i == props.end() || !i->second.valid()) return false;
+            out = i->second.value;
+            return true;
+        };
+
+        uint32_t id = 0;
+        if (!idOf("POSITION", id) || !dracoToFloats(cloud, id, N, 3, dracoPositions))
+        {
+            vsg::warn("Tiles3D::read_pnts(", filename,
+                      ") Draco blob has no usable POSITION attribute.");
+            return {};
+        }
+
+        if (idOf("RGBA", id) && dracoToBytes(cloud, id, N, 4, dracoColours))
+            dracoColourComponents = 4;
+        else if (idOf("RGB", id) && dracoToBytes(cloud, id, N, 3, dracoColours))
+            dracoColourComponents = 3;
+
+        if (idOf("NORMAL", id))
+        {
+            // A normal that will not read is not a reason to lose the cloud;
+            // an unlit cloud is a lesser failure than no cloud.
+            if (!dracoToFloats(cloud, id, N, 3, dracoNormals))
+                dracoNormals.clear();
+        }
+
+        // BATCH_ID is in `props` too. Nothing reads it yet, and it is listed
+        // here rather than silently ignored so the next person can see that the
+        // id is available and only the destination is missing.
+
+        dracoDecoded = true;
+#else
+        (void)compression;
+        vsg::warn("Tiles3D::read_pnts(", filename, ") uses "
+                  "3DTILES_draco_point_compression, and this build has no Draco.");
+        return {};
+#endif
+    }
+
     // ---- positions -------------------------------------------------------
     std::vector<float> positions;
     positions.reserve(N * 3);
 
-    if (featureTable->POSITION && featureTable->POSITION.values.size() >= N * 3)
+    if (dracoDecoded)
+    {
+        positions = std::move(dracoPositions);
+    }
+    else if (featureTable->POSITION && featureTable->POSITION.values.size() >= N * 3)
     {
         positions.assign(featureTable->POSITION.values.begin(),
                          featureTable->POSITION.values.begin() + N * 3);
@@ -456,7 +638,20 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
     // handles only RGBA renders most real point clouds black.
     std::vector<uint8_t> colours(static_cast<size_t>(N) * 4, 255);
 
-    if (featureTable->RGBA && featureTable->RGBA.values.size() >= N * 4)
+    if (dracoColourComponents == 4)
+    {
+        colours = std::move(dracoColours);
+    }
+    else if (dracoColourComponents == 3)
+    {
+        for (size_t i = 0; i < N; ++i)
+        {
+            colours[i * 4 + 0] = dracoColours[i * 3 + 0];
+            colours[i * 4 + 1] = dracoColours[i * 3 + 1];
+            colours[i * 4 + 2] = dracoColours[i * 3 + 2];
+        }
+    }
+    else if (featureTable->RGBA && featureTable->RGBA.values.size() >= N * 4)
     {
         colours.assign(featureTable->RGBA.values.begin(),
                        featureTable->RGBA.values.begin() + N * 4);
@@ -508,7 +703,11 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
     // reading it as one yields normals that all point roughly the same way,
     // which shades a scanned surface as a flat sheet.
     std::vector<float> normals;
-    if (featureTable->NORMAL && featureTable->NORMAL.values.size() >= N * 3)
+    if (!dracoNormals.empty())
+    {
+        normals = std::move(dracoNormals);
+    }
+    else if (featureTable->NORMAL && featureTable->NORMAL.values.size() >= N * 3)
     {
         normals.assign(featureTable->NORMAL.values.begin(),
                        featureTable->NORMAL.values.begin() + N * 3);
@@ -549,6 +748,23 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
     {
         std::fprintf(stderr, "[pnts] N=%u glb=%zu bytes json=%.*s\n",
                      (unsigned)N, glb.size(), 900, glb.data() + 20);
+
+        // The first two points, decoded. Extents alone cannot tell a correct
+        // colour decode from a plausible one, and these are the numbers a
+        // compressed file and its uncompressed twin have to agree on.
+        for (size_t i = 0; i < N && i < 2; ++i)
+        {
+            std::fprintf(stderr, "[pnts]   p%zu pos=(%.5f,%.5f,%.5f) rgba=(%u,%u,%u,%u)",
+                         i, positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2],
+                         (unsigned)colours[i * 4], (unsigned)colours[i * 4 + 1],
+                         (unsigned)colours[i * 4 + 2], (unsigned)colours[i * 4 + 3]);
+            if (normals.size() >= (i + 1) * 3)
+            {
+                std::fprintf(stderr, " n=(%.5f,%.5f,%.5f)",
+                             normals[i * 3], normals[i * 3 + 1], normals[i * 3 + 2]);
+            }
+            std::fprintf(stderr, "\n");
+        }
     }
 
     auto opt = vsg::clone(options);

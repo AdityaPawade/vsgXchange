@@ -273,6 +273,39 @@ namespace vsgXchange
         /// RGBA (ubyte x4), RGB (ubyte x3), RGB565 (a single uint16 with 5/6/5
         /// bit channels) or the global CONSTANT_RGBA. A reader that handles
         /// only RGBA silently renders most real point clouds black.
+        /// 3DTILES_draco_point_compression, on a .pnts feature table.
+        ///
+        /// One Draco-compressed blob in the feature table's binary section
+        /// carries every attribute, and `properties` maps each semantic to the
+        /// blob's own attribute id. The semantics are still listed beside it in
+        /// the feature table, each with byteOffset 0 -- they all point at the
+        /// head of the blob -- so a reader that ignores this extension reads
+        /// compressed bytes as floats and produces a cloud whose extent came
+        /// out [-1.5e+13, 3.4e+28] for a scene that fits in a 5-metre box.
+        ///
+        /// Not the same extension as glTF's KHR_draco_mesh_compression: that
+        /// one names a bufferView and decodes a MESH; this names a byte range
+        /// and decodes a POINT CLOUD, which has no faces.
+        struct VSGXCHANGE_DECLSPEC draco_point_compression : public vsg::Inherit<gltf::ExtensionsExtras, draco_point_compression>
+        {
+            /// Semantic ("POSITION", "RGB", ...) to Draco attribute unique id.
+            gltf::Attributes properties;
+
+            /// Where the compressed blob sits in the feature table's binary.
+            uint32_t byteOffset = 0;
+            uint32_t byteLength = 0;
+
+            // The prototype registered with the parser is cloned per use.
+            vsg::ref_ptr<vsg::Object> clone(const vsg::CopyOp&) const override
+            {
+                return draco_point_compression::create(*this);
+            }
+
+            void report(vsg::LogOutput& output);
+            void read_object(vsg::JSONParser& parser, const std::string_view& property) override;
+            void read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input) override;
+        };
+
         struct VSGXCHANGE_DECLSPEC pnts_FeatureTable : public vsg::Inherit<gltf::ExtensionsExtras, pnts_FeatureTable>
         {
             // storage for binary section
