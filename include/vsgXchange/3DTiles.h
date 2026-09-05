@@ -293,9 +293,28 @@ namespace vsgXchange
             ArraySchema<float> QUANTIZED_VOLUME_OFFSET;
             ArraySchema<float> QUANTIZED_VOLUME_SCALE;
 
+            /// Declared so the JSON is CONSUMED, not because it is decoded yet.
+            ///
+            /// Its width is variable -- the spec allows UNSIGNED_BYTE, SHORT or
+            /// INT via componentType -- and there is nowhere to put per-point
+            /// batch ids until the reader carries feature IDs through. But
+            /// leaving it out is not neutral: an unroutered property means its
+            /// object body is parsed against the feature table itself, the
+            /// string "UNSIGNED_BYTE" desyncs the parser, and everything after
+            /// it in the document is lost. In cesium-native's
+            /// pointCloudBatched.pnts, POINTS_LENGTH sits after BATCH_ID, so
+            /// the whole file read as zero points.
+            ArraySchema<uint8_t> BATCH_ID;
+
             void read_array(vsg::JSONParser& parser, const std::string_view& property) override;
             void read_object(vsg::JSONParser& parser, const std::string_view& property) override;
             void read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input) override;
+
+            /// Swallow the value of any string property this schema does not
+            /// know. Without it an unrecognised semantic -- a future one, a
+            /// vendor extension, anything -- silently truncates the rest of the
+            /// feature table rather than simply being ignored.
+            void read_string(vsg::JSONParser& parser, const std::string_view& property) override;
 
             void convert();
 

@@ -83,8 +83,23 @@ void gltf::ExtensionsExtras::read_object(vsg::JSONParser& parser, const std::str
         parser.read_object(*extras);
     }
     else
+    {
+        // Warn AND consume. parser.warning() only records a message; it does
+        // not advance past the object, so on its own it turns an unrecognised
+        // property into silent loss of every property that follows it. A .pnts
+        // whose feature table carried "extras" ahead of POINTS_LENGTH read as
+        // zero points, and one carrying a vendor extension read as a file with
+        // no positions at all.
         parser.warning();
+        discard_object(parser);
+    }
 };
+
+void gltf::ExtensionsExtras::read_array(vsg::JSONParser& parser, const std::string_view&)
+{
+    parser.warning();
+    discard_array(parser);
+}
 
 void gltf::ExtensionsExtras::report(vsg::LogOutput& output)
 {

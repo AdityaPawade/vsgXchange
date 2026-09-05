@@ -17,6 +17,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include <vsg/io/read.h>
 #include <vsg/nodes/MatrixTransform.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,7 +44,11 @@ void Tiles3D::pnts_FeatureTable::read_array(vsg::JSONParser& parser, const std::
     else if (property == "RTC_CENTER") parser.read_array(RTC_CENTER);
     else if (property == "QUANTIZED_VOLUME_OFFSET") parser.read_array(QUANTIZED_VOLUME_OFFSET);
     else if (property == "QUANTIZED_VOLUME_SCALE") parser.read_array(QUANTIZED_VOLUME_SCALE);
-    else parser.warning();
+    else if (property == "BATCH_ID") parser.read_array(BATCH_ID);
+    // Chain rather than dead-end on parser.warning(): the warning records a
+    // message and consumes nothing, so an unrecognised value left in the
+    // stream silently drops every property that follows it.
+    else gltf::ExtensionsExtras::read_array(parser, property);
 }
 
 void Tiles3D::pnts_FeatureTable::read_object(vsg::JSONParser& parser, const std::string_view& property)
@@ -59,7 +64,13 @@ void Tiles3D::pnts_FeatureTable::read_object(vsg::JSONParser& parser, const std:
     else if (property == "RTC_CENTER") parser.read_object(RTC_CENTER);
     else if (property == "QUANTIZED_VOLUME_OFFSET") parser.read_object(QUANTIZED_VOLUME_OFFSET);
     else if (property == "QUANTIZED_VOLUME_SCALE") parser.read_object(QUANTIZED_VOLUME_SCALE);
-    else parser.warning();
+    // BATCH_ID is routed even though nothing downstream reads it. Leaving it
+    // unrouted is not neutral: cesium-native's pointCloudBatched.pnts spells it
+    // {"byteOffset":192,"componentType":"UNSIGNED_BYTE"} and POINTS_LENGTH
+    // follows it, so the unconsumed object took POINTS_LENGTH with it and the
+    // file read as "POINTS_LENGTH is 0" -- an empty cloud, no error.
+    else if (property == "BATCH_ID") parser.read_object(BATCH_ID);
+    else gltf::ExtensionsExtras::read_object(parser, property);
 }
 
 void Tiles3D::pnts_FeatureTable::read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input)
@@ -67,6 +78,15 @@ void Tiles3D::pnts_FeatureTable::read_number(vsg::JSONParser& parser, const std:
     if (property == "POINTS_LENGTH") input >> POINTS_LENGTH;
     else if (property == "BATCH_LENGTH") input >> BATCH_LENGTH;
     else parser.warning();
+}
+
+void Tiles3D::pnts_FeatureTable::read_string(vsg::JSONParser& parser, const std::string_view&)
+{
+    // Consume and discard. An unrecognised string-valued property that is not
+    // consumed truncates the rest of the feature table, and the symptom is a
+    // file that reads as zero points rather than an error.
+    std::string ignored;
+    parser.read_string(ignored);
 }
 
 void Tiles3D::pnts_FeatureTable::convert()
@@ -131,6 +151,7 @@ namespace
     /// hand their payload to the same reader for the same reason.
     std::string buildPointsGlb(const std::vector<float>& positions,      // 3 per point
                                const std::vector<uint8_t>& colours,      // 4 per point, normalized
+                               const std::vector<float>& normals,        // 3 per point, or empty
                                const vsg::vec3& bbMin, const vsg::vec3& bbMax)
     {
         // size_t throughout: count * 16 in 32-bit arithmetic wraps well inside
@@ -152,15 +173,69 @@ namespace
         for (uint8_t c : colours) fcolours.push_back(static_cast<float>(c) / 255.0f);
         const size_t colBytesF = count * 16;
 
+        const bool hasNormals = normals.size() >= count * 3 && count > 0;
+        const size_t nrmBytes = hasNormals ? count * 12 : 0;
+
         std::string bin;
-        bin.reserve(posBytes + colBytesF + 4);
+        bin.reserve(posBytes + colBytesF + nrmBytes + 4);
         bin.append(reinterpret_cast<const char*>(positions.data()), posBytes);
         bin.append(reinterpret_cast<const char*>(fcolours.data()), colBytesF);
+        if (hasNormals) bin.append(reinterpret_cast<const char*>(normals.data()), nrmBytes);
         while (bin.size() % 4 != 0) bin.push_back('\0');   // chunks are 4-byte aligned
 
         // POSITION accessors REQUIRE min/max; a reader is entitled to reject the
         // asset without them, and vsgXchange uses them for the bound.
         char json[1600];
+
+        if (hasNormals)
+        {
+            // A file that carries NORMAL or NORMAL_OCT16P is describing a
+            // surface sampled as points -- a scan, a photogrammetry mesh
+            // reduced to vertices -- and it wants shading. So this branch drops
+            // KHR_materials_unlit and emits a third accessor, which is the only
+            // reason the file bothered to store normals at all.
+            std::snprintf(json, sizeof(json),
+                "{\"asset\":{\"version\":\"2.0\"},\"scene\":0,"
+                "\"scenes\":[{\"nodes\":[0]}],"
+                "\"nodes\":[{\"mesh\":0,\"name\":\"points\"}],"
+                "\"meshes\":[{\"primitives\":[{\"attributes\":"
+                  "{\"POSITION\":0,\"COLOR_0\":1,\"NORMAL\":2},"
+                "\"mode\":0,\"material\":0}]}],"
+                "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,1,1,1],"
+                "\"metallicFactor\":0,\"roughnessFactor\":1},\"doubleSided\":true}],"
+                "\"accessors\":["
+                  "{\"bufferView\":0,\"componentType\":5126,\"count\":%u,\"type\":\"VEC3\","
+                   "\"min\":[%.9g,%.9g,%.9g],\"max\":[%.9g,%.9g,%.9g]},"
+                  "{\"bufferView\":1,\"componentType\":5126,\"count\":%u,\"type\":\"VEC4\"},"
+                  "{\"bufferView\":2,\"componentType\":5126,\"count\":%u,\"type\":\"VEC3\"}],"
+                "\"bufferViews\":["
+                  "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":%u,\"target\":34962},"
+                  "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962},"
+                  "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962}],"
+                "\"buffers\":[{\"byteLength\":%u}]}",
+                (uint32_t)count, bbMin.x, bbMin.y, bbMin.z, bbMax.x, bbMax.y, bbMax.z,
+                (uint32_t)count, (uint32_t)count,
+                (uint32_t)posBytes,
+                (uint32_t)posBytes, (uint32_t)colBytesF,
+                (uint32_t)(posBytes + colBytesF), (uint32_t)nrmBytes,
+                static_cast<uint32_t>(bin.size()));
+
+            std::string js_n(json);
+            while (js_n.size() % 4 != 0) js_n.push_back(' ');
+
+            std::string glb_n;
+            glb_n.append("glTF", 4);
+            append_u32(glb_n, 2);
+            append_u32(glb_n, static_cast<uint32_t>(12 + 8 + js_n.size() + 8 + bin.size()));
+            append_u32(glb_n, static_cast<uint32_t>(js_n.size()));
+            append_u32(glb_n, 0x4E4F534A);   // "JSON"
+            glb_n += js_n;
+            append_u32(glb_n, static_cast<uint32_t>(bin.size()));
+            append_u32(glb_n, 0x004E4942);   // "BIN"
+            glb_n += bin;
+            return glb_n;
+        }
+
         std::snprintf(json, sizeof(json),
             "{\"asset\":{\"version\":\"2.0\"},\"scene\":0,"
             "\"extensionsUsed\":[\"KHR_materials_unlit\"],"
@@ -186,7 +261,7 @@ namespace
               "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":%u,\"target\":34962},"
               "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962}],"
             "\"buffers\":[{\"byteLength\":%u}]}",
-            count, bbMin.x, bbMin.y, bbMin.z, bbMax.x, bbMax.y, bbMax.z,
+            (uint32_t)count, bbMin.x, bbMin.y, bbMin.z, bbMax.x, bbMax.y, bbMax.z,
             (uint32_t)count, (uint32_t)posBytes, (uint32_t)posBytes, (uint32_t)colBytesF,
             static_cast<uint32_t>(bin.size()));
 
@@ -287,6 +362,28 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
         std::string skip;
         skip.resize(header.batchTableJSONByteLength + header.batchTableBinaryLength);
         fin.read(skip.data(), skip.size());
+    }
+
+    // Draco: refuse the file rather than decode it wrongly.
+    //
+    // 3DTILES_draco_point_compression puts every attribute in one compressed
+    // blob, and the feature table still lists POSITION, RGB and NORMAL -- all
+    // with byteOffset 0, all pointing at the head of that blob. Nothing in the
+    // rest of this function can tell that apart from three real semantics, so
+    // without this check the reader hands the compressed bytes to the
+    // bounding-box loop and produces a cloud whose extent came out
+    // [-1.5e+13, 3.4e+28] for a scene that fits in a 5-metre box.
+    //
+    // That is the worse failure. This check exists because a fix elsewhere --
+    // consuming unrecognised JSON objects instead of letting them desync the
+    // parser -- turned these three corpus files from "POINTS_LENGTH is 0" into
+    // silently converting garbage.
+    if (featureTable->extensions &&
+        featureTable->extensions->values.count("3DTILES_draco_point_compression") > 0)
+    {
+        vsg::warn("Tiles3D::read_pnts(", filename, ") uses "
+                  "3DTILES_draco_point_compression, which is not supported.");
+        return {};
     }
 
     const size_t N = static_cast<size_t>(featureTable->POINTS_LENGTH);
@@ -405,12 +502,53 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_pnts(std::istream& fin, vsg::ref_ptr<con
     }
     // else: opaque white, already filled.
 
-    const std::string glb = buildPointsGlb(positions, colours, bbMin, bbMax);
+    // ---- normals ---------------------------------------------------------
+    // Optional, and in two spellings. NORMAL_OCT16P packs a unit vector into
+    // two bytes by octahedral encoding: it is not a truncated float triple, and
+    // reading it as one yields normals that all point roughly the same way,
+    // which shades a scanned surface as a flat sheet.
+    std::vector<float> normals;
+    if (featureTable->NORMAL && featureTable->NORMAL.values.size() >= N * 3)
+    {
+        normals.assign(featureTable->NORMAL.values.begin(),
+                       featureTable->NORMAL.values.begin() + N * 3);
+    }
+    else if (featureTable->NORMAL_OCT16P && featureTable->NORMAL_OCT16P.values.size() >= N * 2)
+    {
+        const auto& o = featureTable->NORMAL_OCT16P.values;
+        normals.reserve(N * 3);
+        for (size_t i = 0; i < N; ++i)
+        {
+            // The 3D Tiles decode, matching cesium-native's
+            // AttributeCompression::octDecodeInRange: both bytes to [-1,1],
+            // then unfold the lower half of the octahedron, then renormalise.
+            // Dropping the unfold looks almost right -- it is exact on the
+            // upper hemisphere -- and mirrors every downward-facing normal.
+            const float ex = static_cast<float>(o[i * 2 + 0]) / 255.0f * 2.0f - 1.0f;
+            const float ey = static_cast<float>(o[i * 2 + 1]) / 255.0f * 2.0f - 1.0f;
+            float nx = ex;
+            float ny = ey;
+            const float nz = 1.0f - (std::fabs(ex) + std::fabs(ey));
+            if (nz < 0.0f)
+            {
+                const float oldx = nx;
+                nx = (1.0f - std::fabs(ny)) * (oldx >= 0.0f ? 1.0f : -1.0f);
+                ny = (1.0f - std::fabs(oldx)) * (ny >= 0.0f ? 1.0f : -1.0f);
+            }
+            const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+            const float inv = len > 0.0f ? 1.0f / len : 0.0f;
+            normals.push_back(nx * inv);
+            normals.push_back(ny * inv);
+            normals.push_back(nz * inv);
+        }
+    }
+
+    const std::string glb = buildPointsGlb(positions, colours, normals, bbMin, bbMax);
 
     if (const char* dbg = std::getenv("PNTS_DEBUG"); dbg && *dbg)
     {
         std::fprintf(stderr, "[pnts] N=%u glb=%zu bytes json=%.*s\n",
-                     N, glb.size(), 900, glb.data() + 20);
+                     (unsigned)N, glb.size(), 900, glb.data() + 20);
     }
 
     auto opt = vsg::clone(options);

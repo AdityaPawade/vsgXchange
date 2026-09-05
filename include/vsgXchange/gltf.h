@@ -85,6 +85,36 @@ namespace vsgXchange
 
         using Extras = vsg::JSONtoMetaDataSchema;
 
+        /// Consume a JSON value we have no use for, and everything inside it.
+        ///
+        /// vsg::JSONParser::Schema's read_object/read_array/read_string are
+        /// empty, so a schema that answers an unrecognised property with
+        /// parser.warning() alone leaves the value's body sitting in the
+        /// stream. The parser then resyncs on whatever token it meets next and
+        /// EVERY property after that value is silently dropped -- no error, no
+        /// failed read, just missing data.
+        ///
+        /// Recursion is the whole point: consuming one level with a plain
+        /// Schema hands each nested object straight back to the empty base and
+        /// desyncs one level deeper instead.
+        struct DiscardSchema : public vsg::Inherit<vsg::JSONParser::Schema, DiscardSchema>
+        {
+            void read_array(vsg::JSONParser& parser) override { DiscardSchema nested; parser.read_array(nested); }
+            void read_object(vsg::JSONParser& parser) override { DiscardSchema nested; parser.read_object(nested); }
+            void read_string(vsg::JSONParser& parser) override { std::string ignored; parser.read_string(ignored); }
+
+            void read_array(vsg::JSONParser& parser, const std::string_view&) override { DiscardSchema nested; parser.read_array(nested); }
+            void read_object(vsg::JSONParser& parser, const std::string_view&) override { DiscardSchema nested; parser.read_object(nested); }
+            void read_string(vsg::JSONParser& parser, const std::string_view&) override { std::string ignored; parser.read_string(ignored); }
+
+            // read_number, read_bool and read_null need no override: the parser
+            // has already consumed those values before it calls the schema.
+        };
+
+        /// Consume and discard the object or array the parser is positioned on.
+        static void discard_object(vsg::JSONParser& parser) { DiscardSchema d; parser.read_object(d); }
+        static void discard_array(vsg::JSONParser& parser) { DiscardSchema d; parser.read_array(d); }
+
         struct VSGXCHANGE_DECLSPEC ExtensionsExtras : public vsg::Inherit<vsg::JSONParser::Schema, ExtensionsExtras>
         {
             vsg::ref_ptr<Extensions> extensions;
@@ -95,6 +125,13 @@ namespace vsgXchange
             void report(vsg::LogOutput& output);
 
             void read_object(vsg::JSONParser& parser, const std::string_view& property) override;
+
+            /// Every schema in the reader inherits this, so an unrecognised
+            /// array-valued property anywhere is consumed rather than left to
+            /// desync the parser. There is nothing to route here -- neither
+            /// "extensions" nor "extras" is ever an array -- so the override
+            /// exists purely to consume.
+            void read_array(vsg::JSONParser& parser, const std::string_view& property) override;
 
             template<class T>
             vsg::ref_ptr<T> extension(const char* name) const
