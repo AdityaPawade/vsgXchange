@@ -12,6 +12,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 #include <vsgXchange/3DTiles.h>
 
+#include <cstring>
+
 #include <vsg/io/Path.h>
 #include <vsg/io/mem_stream.h>
 #include <vsg/io/read.h>
@@ -61,7 +63,27 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_cmpt(std::istream& fin, vsg::ref_ptr<con
         return {};
     }
 
-    uint32_t sizeOfTiles = header.byteLength - sizeof(Header);
+    // byteLength is the FILE's number. Subtracting the header from it in
+    // unsigned arithmetic wraps for anything under 16, and resize() then asks
+    // for about four gigabytes.
+    if (header.byteLength < sizeof(Header))
+    {
+        vsg::warn("cmpt byteLength ", header.byteLength, " is smaller than its own header.");
+        return {};
+    }
+
+    // A composite is a wrapper: its inner tiles are the payload, so a bound on
+    // how many it may declare is a bound on the work one file can ask for.
+    // Real composites hold a handful.
+    constexpr uint32_t MAX_INNER_TILES = 4096;
+    if (header.tilesLength > MAX_INNER_TILES)
+    {
+        vsg::warn("cmpt declares ", header.tilesLength, " inner tiles, more than the ",
+                  MAX_INNER_TILES, " limit.");
+        return {};
+    }
+
+    const uint32_t sizeOfTiles = header.byteLength - static_cast<uint32_t>(sizeof(Header));
     std::string binary;
     binary.resize(sizeOfTiles);
     fin.read(binary.data(), sizeOfTiles);
@@ -76,8 +98,32 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_cmpt(std::istream& fin, vsg::ref_ptr<con
     uint32_t pos = 0;
     for (uint32_t i = 0; i < header.tilesLength; ++i)
     {
-        InnerHeader* tile = reinterpret_cast<InnerHeader*>(&binary[pos]);
-        innerHeaders.push_back(*tile);
+        // Every one of these checks is about a number that came from the file.
+        // Without them `&binary[pos]` walks off the end of the buffer -- pos
+        // advances by an inner byteLength the file chose, and tilesLength says
+        // how many times to do it. A composite naming 1000 inner tiles in a
+        // 100-byte payload read a kilobyte past its own allocation.
+        if (pos > binary.size() || binary.size() - pos < sizeof(InnerHeader))
+        {
+            vsg::warn("cmpt inner tile ", i, " starts past the end of the payload.");
+            break;
+        }
+
+        InnerHeader tileHeader;
+        std::memcpy(&tileHeader, binary.data() + pos, sizeof(InnerHeader));
+        const InnerHeader* tile = &tileHeader;
+        innerHeaders.push_back(tileHeader);
+
+        // A zero-length inner tile would leave pos where it is: not an endless
+        // loop, since tilesLength bounds the iterations, but it would decode
+        // the same bytes over and over and is malformed either way.
+        if (tile->byteLength < sizeof(InnerHeader) ||
+            tile->byteLength > binary.size() - pos)
+        {
+            vsg::warn("cmpt inner tile ", i, " declares ", tile->byteLength,
+                      " bytes, of which ", binary.size() - pos, " remain.");
+            break;
+        }
 
         vsg::mem_stream binary_fin(reinterpret_cast<uint8_t*>(&binary[pos]), tile->byteLength);
         pos += tile->byteLength;
