@@ -1760,13 +1760,36 @@ vsg::ref_ptr<vsg::Object> gltf::read_glb(std::istream& fin, vsg::ref_ptr<const v
         if (root->buffers.values.size() >= 1)
         {
             auto& firstBuffer = root->buffers.values.front();
-            if (firstBuffer->uri.empty() && firstBuffer->byteLength == binarySize)
+
+            // The BIN chunk may be LONGER than the buffer it carries.
+            //
+            // glTF 2.0 requires every GLB chunk to start on a four-byte
+            // boundary and be padded to one, so a BIN chunk holding a buffer
+            // whose byteLength is not a multiple of four is followed by up to
+            // three trailing zeros that belong to the chunk and not to the
+            // buffer. Demanding equality rejects those files outright.
+            //
+            // The rejection was silent and total: the reader returned a scene
+            // with no vertex arrays, vsgconv reported success and wrote an
+            // 850-byte .vsgt, and the only clue was this warning among the
+            // "no vsg::Data available to create BufferView" that followed.
+            // 21 of the 194 .glb in testdata/3d-tiles-samples and
+            // glTF-Sample-Assets are padded -- 11% of them -- including all 16
+            // trees of 1.1/MetadataGranularities, which is why that tileset
+            // drew four houses standing in an empty field.
+            const bool sizeIsUsable =
+                binarySize >= firstBuffer->byteLength &&
+                (binarySize - firstBuffer->byteLength) < 4;
+
+            if (firstBuffer->uri.empty() && sizeIsUsable)
             {
                 firstBuffer->data = binaryData;
             }
             else
             {
-                vsg::warn("First glTF Buffer not comptible with binary data");
+                vsg::warn("First glTF Buffer not compatible with binary data: buffer byteLength ",
+                          firstBuffer->byteLength, ", BIN chunk ", binarySize,
+                          firstBuffer->uri.empty() ? "" : ", and the buffer names a uri");
             }
         }
         else
