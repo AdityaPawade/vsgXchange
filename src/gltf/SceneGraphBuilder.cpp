@@ -2684,10 +2684,17 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
     //                    reporting success. That is the failure this whole
     //                    session has been about.
     //
-    // Measured against the corpora before it was written: 396 documents declare
-    // 14 distinct extensions between them under extensionsRequired, and all 14
-    // are named below -- so this refuses nothing that works today. What it
-    // refuses is the fifteenth.
+    // Measured against the corpora -- and the first measurement was WRONG in a
+    // way worth recording. It scanned standalone .gltf and .glb files and found
+    // 14 distinct required extensions across 396 documents, all named below.
+    // But 3D Tiles content is b3dm and i3dm: the glTF sits behind a header, and
+    // that scan never decomposed one. Decoding the 101 embedded payloads in
+    // 3d-tiles-samples turns up a fifteenth, KHR_techniques_webgl, required by
+    // TilesetWithTreeBillboards -- which this rule duly refused, taking a
+    // tileset that had worked all day with it.
+    //
+    // So: 15 distinct required extensions across both corpora, standalone and
+    // embedded, and all 15 are named below.
     static const std::set<std::string> fullySupported = {
         "KHR_mesh_quantization",
         "KHR_texture_transform",
@@ -2718,6 +2725,12 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
         "KHR_materials_volume",
         "KHR_materials_variants",
         "KHR_materials_dispersion",
+        // glTF 1.0's shader-technique extension, still required by some 3D
+        // Tiles 1.0 content -- 3d-tiles-samples' TilesetWithTreeBillboards is
+        // one. It carries programs and techniques for MATERIALS; the
+        // positions, indices and transforms underneath are untouched, so the
+        // model draws with a default material instead of its authored shader.
+        "KHR_techniques_webgl",
         // Texture container formats. An unreadable texture leaves the surface
         // untextured; the geometry underneath it is unaffected.
         "KHR_texture_basisu",
