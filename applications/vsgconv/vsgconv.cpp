@@ -1,6 +1,15 @@
+#if defined(_WIN32)
+#    define NOMINMAX
+#    define WIN32_LEAN_AND_MEAN
+#    include <windows.h>
+#    include <shellapi.h>
+#endif
+
 #include <vsg/all.h>
 
 #include <chrono>
+#include <string>
+#include <vector>
 #include <iostream>
 #include <ostream>
 #include <thread>
@@ -277,8 +286,86 @@ void printHelp(std::ostream& out)
     out << "    -v --version          # report version\n";
 }
 
+namespace vsgconv
+{
+#if defined(_WIN32)
+    //! main()'s arguments, re-read from Windows as UTF-8.
+    //!
+    //! MSVC hands main() its argv in the process ANSI code page. On a machine
+    //! set to cp1252 -- which is the default on a British or American Windows --
+    //! every character outside that page arrives as a literal '?', and the
+    //! damage is done before any of our code runs. A path under a directory
+    //! named with Devanagari or CJK characters reaches the reader as
+    //! "...\\?????-??\\Box.glb" and fails with "Failed to load", naming a file
+    //! that plainly exists.
+    //!
+    //! vsg::Path is not the problem: on Windows it stores wchar_t and converts
+    //! narrow input through convert_utf, which reads it as UTF-8. So the whole
+    //! fix is to hand it UTF-8 -- taken from GetCommandLineW, which is lossless
+    //! whatever the code page.
+    class Utf8Argv
+    {
+    public:
+        //! Returns nullptr if the arguments could not be re-read, in which case
+        //! the caller keeps the argv it was given. That is the pre-existing
+        //! behaviour: ASCII paths still work, non-ASCII ones still fail, and
+        //! nothing new breaks.
+        char** rebuild(int expected_argc)
+        {
+            int wide_argc = 0;
+            wchar_t** wide_argv = ::CommandLineToArgvW(::GetCommandLineW(), &wide_argc);
+            if (!wide_argv) return nullptr;
+
+            // A mismatch means the two views of the command line disagree, and
+            // guessing which is right would be worse than doing nothing.
+            if (wide_argc != expected_argc)
+            {
+                ::LocalFree(wide_argv);
+                return nullptr;
+            }
+
+            _storage.reserve(static_cast<size_t>(wide_argc));
+            for (int i = 0; i < wide_argc; ++i)
+            {
+                const int bytes = ::WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1,
+                                                        nullptr, 0, nullptr, nullptr);
+                if (bytes <= 0)
+                {
+                    ::LocalFree(wide_argv);
+                    _storage.clear();
+                    return nullptr;
+                }
+                std::string s(static_cast<size_t>(bytes - 1), '\0');
+                ::WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1,
+                                      s.data(), bytes, nullptr, nullptr);
+                _storage.push_back(std::move(s));
+            }
+            ::LocalFree(wide_argv);
+
+            // The pointers must stay valid for as long as the caller uses them,
+            // and vsg::CommandLine keeps the array and shuffles it, so this
+            // object has to outlive the parsing. It is a local in main().
+            _pointers.reserve(_storage.size() + 1);
+            for (auto& s : _storage) _pointers.push_back(s.data());
+            _pointers.push_back(nullptr);
+            return _pointers.data();
+        }
+
+    private:
+        std::vector<std::string> _storage;
+        std::vector<char*> _pointers;
+    };
+#endif
+} // namespace vsgconv
+
 int main(int argc, char** argv)
 {
+#if defined(_WIN32)
+    // Must outlive vsg::CommandLine below: it keeps the array.
+    vsgconv::Utf8Argv utf8_argv;
+    if (char** rebuilt = utf8_argv.rebuild(argc)) argv = rebuilt;
+#endif
+
     // use the vsg::Options object to pass the vsgXchange::all ReaderWriter to use when reading files.
     auto options = vsg::Options::create(vsgXchange::all::create());
     options->paths = vsg::getEnvPaths("VSG_FILE_PATH");
