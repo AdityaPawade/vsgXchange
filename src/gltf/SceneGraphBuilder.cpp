@@ -21,6 +21,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 </editor-fold> */
 
+#include <vsg/core/Auxiliary.h>
 #include <set>
 
 #include <limits>
@@ -139,6 +140,16 @@ vsg::ref_ptr<vsg::Data> gltf::SceneGraphBuilder::createBufferView(vsg::ref_ptr<g
     if (!vsg_buffers[gltf_bufferView->buffer.value])
     {
         vsg::info("Warning: no vsg::Data available to create BufferView.");
+        return {};
+    }
+
+    if (gltf_bufferView->byteStride == 0)
+    {
+        // The default is 1 and the specification requires 4..252 when the
+        // property is present, so this is a malformed document -- but the
+        // division below would be by zero, on a number an untrusted server
+        // chose.
+        vsg::warn("gltf: bufferView declares byteStride 0; it is skipped.");
         return {};
     }
 
@@ -948,6 +959,328 @@ vsg::ref_ptr<vsg::DescriptorConfigurator> gltf::SceneGraphBuilder::createMateria
         return createPbrMaterial(gltf_material);
 }
 
+// ---------------------------------------------------------------------------
+// 3D Tiles 1.1 per-feature metadata: EXT_structural_metadata + EXT_mesh_features
+//
+// 1.1 says what a 1.0 batch table said, in a different place and with a real
+// type system. A document-level `schema` names classes and the type of each of
+// their properties; a `propertyTable` holds one column per property, in a
+// bufferView; and a primitive's EXT_mesh_features says which of its
+// `_FEATURE_ID_n` attributes indexes which table.
+//
+// Neither extension has a registered schema in this reader, so both arrive as
+// the generic metadata tree JSONtoMetaDataSchema builds for anything
+// unrecognised: nested objects are vsg::Object, arrays are vsg::Objects,
+// numbers are doubleValue and strings are stringValue. That is enough to read
+// them without writing a second SAX parser for a structure this reader only
+// ever needs to walk, never to round-trip.
+//
+// Both spellings end up in the same Tiles3D::FeatureTable, so nothing
+// downstream of the reader has to know which one a tileset used.
+// ---------------------------------------------------------------------------
+namespace
+{
+    vsg::Object* metaObject(vsg::Object& o, const char* name)
+    {
+        return o.getObject(name);
+    }
+
+    vsg::Objects* metaArray(vsg::Object& o, const char* name)
+    {
+        return dynamic_cast<vsg::Objects*>(o.getObject(name));
+    }
+
+    //! A number from the metadata tree. False when absent or not a number, so a
+    //! missing index can never be mistaken for index 0.
+    bool metaNumber(vsg::Object& o, const char* name, double& out)
+    {
+        if (auto v = dynamic_cast<vsg::doubleValue*>(o.getObject(name)))
+        {
+            out = v->value();
+            return true;
+        }
+        return false;
+    }
+
+    std::string metaString(vsg::Object& o, const char* name)
+    {
+        if (auto v = dynamic_cast<vsg::stringValue*>(o.getObject(name)))
+            return v->value();
+        return {};
+    }
+
+    //! EXT_structural_metadata spells component types by name; the rest of glTF
+    //! uses the GL constants. Returns 0 for the two 64-bit integer types, which
+    //! have no glTF constant and no vsg::Array to hold them.
+    uint32_t componentTypeConstant(const std::string& name)
+    {
+        if (name == "INT8") return gltf::COMPONENT_TYPE_BYTE;
+        if (name == "UINT8") return gltf::COMPONENT_TYPE_UNSIGNED_BYTE;
+        if (name == "INT16") return gltf::COMPONENT_TYPE_SHORT;
+        if (name == "UINT16") return gltf::COMPONENT_TYPE_UNSIGNED_SHORT;
+        if (name == "INT32") return gltf::COMPONENT_TYPE_INT;
+        if (name == "UINT32") return gltf::COMPONENT_TYPE_UNSIGNED_INT;
+        if (name == "FLOAT32") return gltf::COMPONENT_TYPE_FLOAT;
+        if (name == "FLOAT64") return gltf::COMPONENT_TYPE_DOUBLE;
+        return gltf::COMPONENT_TYPE_UNDEFINED;
+    }
+
+    //! A STRING column: UTF-8 bytes in one bufferView, and count+1 offsets into
+    //! them in another.
+    vsg::ref_ptr<vsg::Data> decodeStringColumn(gltf::SceneGraphBuilder& builder,
+                                               uint32_t valuesView, uint32_t offsetsView,
+                                               const std::string& offsetType, uint32_t count)
+    {
+        if (valuesView >= builder.vsg_bufferViews.size()) return {};
+        if (offsetsView >= builder.vsg_bufferViews.size()) return {};
+
+        auto values = builder.vsg_bufferViews[valuesView];
+        auto offsets = builder.vsg_bufferViews[offsetsView];
+        if (!values || !offsets) return {};
+
+        // Every offset is read, so the width has to be right rather than
+        // assumed: a UINT32 default read as UINT16 silently halves the string.
+        const uint32_t width =
+            (offsetType == "UINT8") ? 1u :
+            (offsetType == "UINT16") ? 2u :
+            (offsetType == "UINT64") ? 8u : 4u;      // UINT32 is the default
+
+        const uint8_t* offsetBytes = static_cast<const uint8_t*>(offsets->dataPointer());
+        const size_t offsetsSize = offsets->dataSize();
+
+        // count + 1 offsets: the last one closes the last string.
+        if (offsetsSize < size_t(count + 1) * width) return {};
+
+        auto readOffset = [&](uint32_t i) -> uint64_t {
+            const uint8_t* p = offsetBytes + size_t(i) * width;
+            uint64_t v = 0;
+            std::memcpy(&v, p, width);               // little-endian, as glTF is
+            return v;
+        };
+
+        const uint8_t* text = static_cast<const uint8_t*>(values->dataPointer());
+        const size_t textSize = values->dataSize();
+
+        auto strings = vsg::stringArray::create(count);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const uint64_t begin = readOffset(i);
+            const uint64_t end = readOffset(i + 1);
+
+            // Offsets come from the document. Anything that would read outside
+            // the values view, or backwards, yields an empty string rather than
+            // a read off the end of the buffer.
+            if (end < begin || end > textSize)
+            {
+                strings->at(i) = std::string();
+                continue;
+            }
+            strings->at(i) = std::string(reinterpret_cast<const char*>(text + begin),
+                                         size_t(end - begin));
+        }
+        return strings;
+    }
+
+    //! One property column, decoded by the type its class declares.
+    vsg::ref_ptr<vsg::Data> createPropertyColumn(gltf::SceneGraphBuilder& builder,
+                                                 vsg::Object& classProperty,
+                                                 vsg::Object& tableProperty,
+                                                 uint32_t count,
+                                                 const std::string& name)
+    {
+        double valuesView = 0.0;
+        if (!metaNumber(tableProperty, "values", valuesView)) return {};
+        if (valuesView < 0.0 || valuesView >= double(builder.vsg_bufferViews.size())) return {};
+
+        const std::string type = metaString(classProperty, "type");
+
+        // Variable-length arrays need arrayOffsets and a second indirection.
+        // Refused rather than half-read: a column silently truncated to its
+        // first element would read as data, not as an omission.
+        double unusedArrayOffsets = 0.0;
+        if (metaNumber(tableProperty, "arrayOffsets", unusedArrayOffsets))
+        {
+            vsg::warn("gltf: EXT_structural_metadata property \"", name,
+                      "\" is a variable-length array; it is not read.");
+            return {};
+        }
+
+        if (type == "STRING")
+        {
+            double offsetsView = 0.0;
+            if (!metaNumber(tableProperty, "stringOffsets", offsetsView)) return {};
+            if (offsetsView < 0.0 || offsetsView >= double(builder.vsg_bufferViews.size()))
+                return {};
+
+            return decodeStringColumn(builder, uint32_t(valuesView), uint32_t(offsetsView),
+                                      metaString(tableProperty, "stringOffsetType"), count);
+        }
+
+        // BOOLEAN is a bitstream and ENUM needs the schema's enum tables. Both
+        // are legal and neither is read here; saying so beats an empty column.
+        if (type == "BOOLEAN" || type == "ENUM")
+        {
+            vsg::warn("gltf: EXT_structural_metadata property \"", name, "\" has type ",
+                      type, ", which is not read.");
+            return {};
+        }
+
+        const uint32_t componentType =
+            componentTypeConstant(metaString(classProperty, "componentType"));
+
+        if (componentType == gltf::COMPONENT_TYPE_UNDEFINED)
+        {
+            vsg::warn("gltf: EXT_structural_metadata property \"", name,
+                      "\" has component type ", metaString(classProperty, "componentType"),
+                      ", which has no array type here; it is dropped.");
+            return {};
+        }
+
+        // createArray dereferences the view without checking it. A view can be
+        // null -- createBufferView returns null for a buffer that did not load,
+        // and now for a byteStride of 0 -- and this is the first caller that can
+        // reach one, because a property table names bufferViews DIRECTLY rather
+        // than through an accessor the reader has already validated.
+        if (!builder.vsg_bufferViews[size_t(valuesView)])
+        {
+            vsg::warn("gltf: EXT_structural_metadata property \"", name,
+                      "\" names bufferView ", uint32_t(valuesView),
+                      ", which did not load; the property is dropped.");
+            return {};
+        }
+
+        return builder.createArray(type, componentType, gltf::glTFid{uint32_t(valuesView)},
+                                   0, count);
+    }
+
+    //! The property table `index` of EXT_structural_metadata, as a FeatureTable.
+    vsg::ref_ptr<Tiles3D::FeatureTable> createPropertyTable(gltf::SceneGraphBuilder& builder,
+                                                            uint32_t index)
+    {
+        if (!builder.model) return {};
+
+        auto ext = builder.model->extension<vsg::JSONtoMetaDataSchema>("EXT_structural_metadata");
+        if (!ext || !ext->object) return {};
+
+        // One table is routinely shared by many primitives -- there is a sample
+        // named for it -- and decoding its columns again for each of them costs
+        // the whole table per primitive.
+        const std::string cacheKey = "vsgXchange.propertyTable." + std::to_string(index);
+        if (auto cached = builder.model->getObject<Tiles3D::FeatureTable>(cacheKey))
+            return vsg::ref_ptr<Tiles3D::FeatureTable>(cached);
+
+        auto tables = metaArray(*ext->object, "propertyTables");
+        if (!tables || index >= tables->children.size()) return {};
+
+        auto table = tables->children[index];
+        if (!table) return {};
+
+        double count = 0.0;
+        if (!metaNumber(*table, "count", count) || count <= 0.0) return {};
+
+        // The class names the type of every column. Without it the bytes in the
+        // bufferViews have no meaning at all.
+        const std::string className = metaString(*table, "class");
+        auto schema = metaObject(*ext->object, "schema");
+        if (!schema) return {};
+        auto classes = metaObject(*schema, "classes");
+        if (!classes) return {};
+        auto klass = className.empty() ? nullptr : metaObject(*classes, className.c_str());
+        if (!klass) return {};
+        auto classProperties = metaObject(*klass, "properties");
+        if (!classProperties) return {};
+
+        auto tableProperties = metaObject(*table, "properties");
+        if (!tableProperties) return {};
+
+        // Same caps as the 1.0 path, and for the same reason: every accepted
+        // column is retained for the life of the tile and formatted on every
+        // click, and all of it came from a document fetched over HTTP.
+        constexpr size_t MAX_PROPERTIES = 128;
+        constexpr size_t MAX_NAME_LENGTH = 256;
+
+        auto features = Tiles3D::FeatureTable::create();
+        features->count = uint32_t(count);
+
+        // The properties a table declares are user objects on its metadata node,
+        // so the map on the Auxiliary is the only way to enumerate them.
+        auto aux = tableProperties->getAuxiliary();
+        if (!aux) return {};
+
+        for (auto& [name, value] : aux->userObjects)
+        {
+            if (features->properties.size() >= MAX_PROPERTIES)
+            {
+                vsg::warn("gltf: EXT_structural_metadata declares more than ", MAX_PROPERTIES,
+                          " properties; the rest are dropped.");
+                break;
+            }
+            if (name.size() > MAX_NAME_LENGTH) continue;
+
+            auto tableProperty = value.cast<vsg::Object>();
+            if (!tableProperty) continue;
+
+            auto classProperty = dynamic_cast<vsg::Object*>(classProperties->getObject(name));
+            if (!classProperty) continue;
+
+            if (auto column = createPropertyColumn(builder, *classProperty, *tableProperty,
+                                                   features->count, name))
+            {
+                // Shorter than the table says would be read past its end by
+                // anything indexing it by feature.
+                if (column->valueCount() < features->count)
+                {
+                    vsg::warn("gltf: EXT_structural_metadata property \"", name, "\" has ",
+                              column->valueCount(), " values for ", features->count,
+                              " features; it is dropped.");
+                    continue;
+                }
+                features->properties[name] = column;
+            }
+        }
+
+        if (features->properties.empty()) return {};
+
+        builder.model->setObject(cacheKey, features);
+        return features;
+    }
+
+    //! EXT_mesh_features: which attribute holds this primitive's ids, and which
+    //! property table describes them.
+    //!
+    //! Only the first featureIds entry that names an ATTRIBUTE is used. A
+    //! primitive may declare several, and one may be a feature-id TEXTURE --
+    //! which needs a texture sample per pick and is a different mechanism
+    //! entirely, so it is skipped rather than misread as an attribute index.
+    bool readMeshFeatures(gltf::Primitive& primitive, int& out_attribute, int& out_propertyTable)
+    {
+        auto ext = primitive.extension<vsg::JSONtoMetaDataSchema>("EXT_mesh_features");
+        if (!ext || !ext->object) return false;
+
+        auto featureIds = metaArray(*ext->object, "featureIds");
+        if (!featureIds) return false;
+
+        for (auto& entry : featureIds->children)
+        {
+            if (!entry) continue;
+
+            double attribute = 0.0;
+            if (!metaNumber(*entry, "attribute", attribute)) continue;   // texture, or a constant
+            if (attribute < 0.0) continue;
+
+            out_attribute = int(attribute);
+
+            double propertyTable = 0.0;
+            out_propertyTable = metaNumber(*entry, "propertyTable", propertyTable) && propertyTable >= 0.0
+                ? int(propertyTable)
+                : -1;
+
+            return true;
+        }
+        return false;
+    }
+}
+
 vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::Mesh> gltf_mesh, const MeshExtras& meshExtras)
 {
     /*
@@ -1478,7 +1811,23 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
         // ray intersection reports the path of nodes it passed through, and the
         // state group is on that path. The array is parallel to POSITION, so
         // the vertex index the intersection returns indexes it directly.
-        for (const char* semantic : {"_BATCHID", "_FEATURE_ID_0"})
+        // Which attribute, and which table describes it.
+        //
+        // EXT_mesh_features names both explicitly, and it is the only thing that
+        // can: 1.1 allows several id sets on one primitive, and the one the
+        // properties belong to is not necessarily _FEATURE_ID_0. Without the
+        // extension -- every 1.0 tile, and the 1.1 documents that carry ids but
+        // no table -- fall back to the conventional names.
+        int featureAttribute = -1;
+        int featurePropertyTable = -1;
+
+        std::vector<std::string> semantics;
+        if (readMeshFeatures(*primitive, featureAttribute, featurePropertyTable))
+            semantics.push_back("_FEATURE_ID_" + std::to_string(featureAttribute));
+        semantics.push_back("_BATCHID");
+        semantics.push_back("_FEATURE_ID_0");
+
+        for (const std::string& semantic : semantics)
         {
             auto itr = primitive->attributes.values.find(semantic);
             if (itr == primitive->attributes.values.end()) continue;
@@ -1499,6 +1848,19 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
             }
 
             stateGroup->setObject(Tiles3D::FEATURE_IDS_KEY, ids);
+
+            // 1.1 keeps the properties in the DOCUMENT rather than in the tile
+            // wrapper, so they are attached here, on the same node as the ids.
+            // A 1.0 tile's properties arrive later, from the b3dm reader, and
+            // land on this same node for the same reason: a consumer that finds
+            // the two separately can pair a nested tile's ids with an
+            // ancestor's table and report the wrong feature confidently.
+            if (featurePropertyTable >= 0)
+            {
+                if (auto table = createPropertyTable(*this, uint32_t(featurePropertyTable)))
+                    stateGroup->setObject(Tiles3D::FEATURE_TABLE_KEY, table);
+            }
+
             break;      // 1.0 and 1.1 do not appear together; the first wins
         }
 

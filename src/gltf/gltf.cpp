@@ -65,7 +65,19 @@ void gltf::Extensions::read_object(vsg::JSONParser& parser, const std::string_vi
         }
     }
 
-    vsg::info("gltf::Extensions::read_object() ", property, " not supported.");
+    // Some extensions have no schema here and are still READ. The 3D Tiles 1.1
+    // metadata pair is walked straight off the generic tree built below, which
+    // is enough for a structure the reader only ever needs to inspect. Saying
+    // "not supported" of those is false, and it has already sent one
+    // investigation down the wrong path -- the log line was cited as evidence
+    // the extensions were being discarded.
+    const bool keptAndRead =
+        str_property == "EXT_structural_metadata" || str_property == "EXT_mesh_features";
+
+    if (keptAndRead)
+        vsg::info("gltf::Extensions::read_object() ", property, " read as metadata.");
+    else
+        vsg::info("gltf::Extensions::read_object() ", property, " not supported.");
 
     auto extensionAsMetaData = JSONtoMetaDataSchema::create();
     parser.read_object(*extensionAsMetaData);

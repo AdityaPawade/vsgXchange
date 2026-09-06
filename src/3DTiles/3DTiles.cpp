@@ -418,6 +418,30 @@ namespace
             return true;
         }
 
+        //! A vector property, as "x, y, z".
+        //!
+        //! 3D Tiles 1.1 gives properties a real type system, and a VEC3 is an
+        //! ordinary thing for one to be -- the corpus's own
+        //! FeatureIdAttributeAndPropertyTable sample has exactly one property
+        //! and it is a VEC3 of floats. Without this it formats as empty, which
+        //! reads as "this tileset carries no metadata".
+        template<typename A>
+        bool takeVector(const vsg::Data& data, uint32_t components)
+        {
+            const auto* a = dynamic_cast<const A*>(&data);
+            if (!a || index >= a->size()) return false;
+
+            const auto& v = a->at(index);
+            std::string out;
+            for (uint32_t c = 0; c < components; ++c)
+            {
+                if (c > 0) out += ", ";
+                out += number(static_cast<double>(v[c]));
+            }
+            result = out;
+            return true;
+        }
+
         void apply(const vsg::Data& data) override
         {
             if (auto strings = dynamic_cast<const vsg::stringArray*>(&data))
@@ -425,6 +449,32 @@ namespace
                 if (index < strings->size()) result = strings->at(index);
                 return;
             }
+
+            if (takeVector<vsg::vec2Array>(data, 2)) return;
+            if (takeVector<vsg::vec3Array>(data, 3)) return;
+            if (takeVector<vsg::vec4Array>(data, 4)) return;
+            if (takeVector<vsg::dvec2Array>(data, 2)) return;
+            if (takeVector<vsg::dvec3Array>(data, 3)) return;
+            if (takeVector<vsg::dvec4Array>(data, 4)) return;
+            if (takeVector<vsg::ivec2Array>(data, 2)) return;
+            if (takeVector<vsg::ivec3Array>(data, 3)) return;
+            if (takeVector<vsg::ivec4Array>(data, 4)) return;
+            if (takeVector<vsg::uivec2Array>(data, 2)) return;
+            if (takeVector<vsg::uivec3Array>(data, 3)) return;
+            if (takeVector<vsg::uivec4Array>(data, 4)) return;
+            if (takeVector<vsg::svec2Array>(data, 2)) return;
+            if (takeVector<vsg::svec3Array>(data, 3)) return;
+            if (takeVector<vsg::svec4Array>(data, 4)) return;
+            if (takeVector<vsg::usvec2Array>(data, 2)) return;
+            if (takeVector<vsg::usvec3Array>(data, 3)) return;
+            if (takeVector<vsg::usvec4Array>(data, 4)) return;
+            if (takeVector<vsg::bvec2Array>(data, 2)) return;
+            if (takeVector<vsg::bvec3Array>(data, 3)) return;
+            if (takeVector<vsg::bvec4Array>(data, 4)) return;
+            if (takeVector<vsg::ubvec2Array>(data, 2)) return;
+            if (takeVector<vsg::ubvec3Array>(data, 3)) return;
+            if (takeVector<vsg::ubvec4Array>(data, 4)) return;
+
             if (take<vsg::doubleArray>(data)) return;
             if (take<vsg::floatArray>(data)) return;
             if (take<vsg::intArray>(data)) return;
