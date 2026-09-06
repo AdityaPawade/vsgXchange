@@ -749,6 +749,26 @@ void gltf::KHR_draco_mesh_compression::read_object(vsg::JSONParser& parser, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
+// CESIUM_primitive_outline
+//
+void gltf::CESIUM_primitive_outline::report(vsg::LogOutput& output)
+{
+    output.enter("CESIUM_primitive_outline {");
+    ExtensionsExtras::report(output);
+    output("indices = ", indices.value);
+    output.leave();
+}
+
+void gltf::CESIUM_primitive_outline::read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input)
+{
+    if (property == "indices")
+        input >> indices;
+    else
+        parser.warning();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
 // EXT_meshopt_compression
 //
 void gltf::EXT_meshopt_compression::report(vsg::LogOutput& output)
@@ -2223,6 +2243,7 @@ void gltf::assignExtensions(vsg::JSONParser& parser) const
     parser.setObject("KHR_materials_ior", KHR_materials_ior::create());
     parser.setObject("EXT_mesh_gpu_instancing", EXT_mesh_gpu_instancing::create());
     parser.setObject("EXT_meshopt_compression", EXT_meshopt_compression::create());
+    parser.setObject("CESIUM_primitive_outline", CESIUM_primitive_outline::create());
     parser.setObject("KHR_materials_unlit", KHR_materials_unlit::create());
     parser.setObject("KHR_texture_transform", KHR_texture_transform::create());
     parser.setObject("KHR_lights_punctual", KHR_lights_punctual::create());

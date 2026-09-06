@@ -488,6 +488,23 @@ namespace vsgXchange
             void read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input) override;
         };
 
+        /// https://github.com/CesiumGS/glTF/tree/3d-tiles-next/extensions/2.0/Vendor/CESIUM_primitive_outline
+        ///
+        /// Names an accessor of vertex-index PAIRS -- the edges of the original
+        /// model, before it was triangulated. A cube's six quads triangulate to
+        /// twelve triangles with eighteen shared edges; the extension says
+        /// which twelve of those the modeller actually drew.
+        struct VSGXCHANGE_DECLSPEC CESIUM_primitive_outline : public vsg::Inherit<ExtensionsExtras, CESIUM_primitive_outline>
+        {
+            glTFid indices;
+
+            // extention prototype will be cloned when it's used.
+            vsg::ref_ptr<vsg::Object> clone(const vsg::CopyOp&) const override { return CESIUM_primitive_outline::create(*this); }
+
+            void report(vsg::LogOutput& output);
+            void read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input) override;
+        };
+
         /// https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Vendor/EXT_meshopt_compression
         ///
         /// Sits on a bufferView and says "the bytes you want are not where the
@@ -841,6 +858,11 @@ namespace vsgXchange
             /// distance. A 29,338-point cloud covered 0.69% of the viewport
             /// where a mesh of the same extent covered 8%, which reads as a
             /// failed load rather than as data.
+            /// The modeller's edges, as a LINE_LIST over the primitive's own
+            /// positions. Null when the extension names nothing usable.
+            vsg::ref_ptr<vsg::Node> createPrimitiveOutline(vsg::ref_ptr<Primitive> primitive,
+                                                           const CESIUM_primitive_outline& outline);
+
             vsg::ref_ptr<vsg::ShaderSet> getOrCreatePointShaderSet();
 
             vsg::ref_ptr<vsg::Object> createSceneGraph(vsg::ref_ptr<gltf::glTF> in_model, vsg::ref_ptr<const vsg::Options> in_options);

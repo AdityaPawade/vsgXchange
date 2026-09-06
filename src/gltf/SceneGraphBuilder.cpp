@@ -1342,6 +1342,35 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
         {
             nodes.push_back(stateGroup);
         }
+
+        // CESIUM_primitive_outline: draw the modeller's edges as lines.
+        //
+        // The extension names an accessor of vertex-index PAIRS -- the edges of
+        // the model before it was triangulated. A cube's six quads become
+        // twelve triangles with eighteen shared edges, and the extension says
+        // which twelve of those a person actually drew.
+        //
+        // CesiumJS renders these by generating a per-vertex "outline
+        // coordinate" and darkening fragments near an edge through a 1D texture
+        // lookup, which needs a bespoke shader and can duplicate vertices. This
+        // draws them as an actual LINE_LIST over the same positions instead:
+        // less exact at glancing angles, a great deal less machinery, and the
+        // edges are visibly there rather than absent. Said plainly here so the
+        // difference from the reference is not mistaken for a bug.
+        if (primitive->extensions)
+        {
+            auto outline_itr = primitive->extensions->values.find("CESIUM_primitive_outline");
+            if (outline_itr != primitive->extensions->values.end() && outline_itr->second)
+            {
+                if (auto outline = outline_itr->second->cast<gltf::CESIUM_primitive_outline>())
+                {
+                    if (auto outlineNode = createPrimitiveOutline(primitive, *outline))
+                    {
+                        nodes.push_back(outlineNode);
+                    }
+                }
+            }
+        }
     }
 
     if (nodes.empty())
@@ -2136,6 +2165,191 @@ vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreatePbrShaderSet()
     if (sharedObjects) sharedObjects->share(pbrShaderSet);
 
     return pbrShaderSet;
+}
+
+vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createPrimitiveOutline(
+    vsg::ref_ptr<gltf::Primitive> primitive, const gltf::CESIUM_primitive_outline& outline)
+{
+    auto position_itr = primitive->attributes.values.find("POSITION");
+    if (position_itr == primitive->attributes.values.end()) return {};
+    if (!position_itr->second.valid() || position_itr->second.value >= vsg_accessors.size()) return {};
+
+    auto positions = vsg_accessors[position_itr->second.value].cast<vsg::vec3Array>();
+    if (!positions || positions->empty()) return {};
+
+    if (!outline.indices.valid() || outline.indices.value >= vsg_accessors.size()) return {};
+    auto rawIndices = vsg_accessors[outline.indices.value];
+    if (!rawIndices) return {};
+
+    // Vulkan indexes with 16- or 32-bit integers only, and the extension's
+    // accessor may be any of the three unsigned widths. Widen a byte accessor
+    // rather than declining it: an outline is decoration, and refusing to draw
+    // one over an index width is a poor trade.
+    vsg::ref_ptr<vsg::Data> indices;
+    if (auto u32 = rawIndices.cast<vsg::uintArray>())
+    {
+        indices = u32;
+    }
+    else if (auto u16 = rawIndices.cast<vsg::ushortArray>())
+    {
+        indices = u16;
+    }
+    else if (auto u8 = rawIndices.cast<vsg::ubyteArray>())
+    {
+        auto widened = vsg::ushortArray::create(u8->size());
+        auto dest = widened->begin();
+        for (auto v : *u8) *(dest++) = static_cast<uint16_t>(v);
+        indices = widened;
+    }
+    else if (auto s16 = rawIndices.cast<vsg::shortArray>())
+    {
+        // glTF says an index accessor is unsigned, but 3d-tiles-samples'
+        // BoxPrimitiveOutline declares componentType 5122 -- SIGNED short --
+        // and CesiumJS reads it anyway. Follow the reference and accept it,
+        // while refusing a genuinely negative index rather than wrapping it
+        // to 65535 and reading off the end of the vertex buffer.
+        auto widened = vsg::ushortArray::create(s16->size());
+        auto dest = widened->begin();
+        for (auto v : *s16)
+        {
+            if (v < 0)
+            {
+                vsg::warn("CESIUM_primitive_outline: a signed index accessor holds ", v,
+                          "; the outline is skipped.");
+                return {};
+            }
+            *(dest++) = static_cast<uint16_t>(v);
+        }
+        indices = widened;
+    }
+    else if (auto s8 = rawIndices.cast<vsg::byteArray>())
+    {
+        auto widened = vsg::ushortArray::create(s8->size());
+        auto dest = widened->begin();
+        for (auto v : *s8)
+        {
+            if (v < 0)
+            {
+                vsg::warn("CESIUM_primitive_outline: a signed index accessor holds ", int(v),
+                          "; the outline is skipped.");
+                return {};
+            }
+            *(dest++) = static_cast<uint16_t>(v);
+        }
+        indices = widened;
+    }
+    else if (auto s32 = rawIndices.cast<vsg::intArray>())
+    {
+        auto widened = vsg::uintArray::create(s32->size());
+        auto dest = widened->begin();
+        for (auto v : *s32)
+        {
+            if (v < 0)
+            {
+                vsg::warn("CESIUM_primitive_outline: a signed index accessor holds ", v,
+                          "; the outline is skipped.");
+                return {};
+            }
+            *(dest++) = static_cast<uint32_t>(v);
+        }
+        indices = widened;
+    }
+    else
+    {
+        vsg::warn("CESIUM_primitive_outline: index accessor is ", rawIndices->className(),
+                  ", which is not an integer array; the outline is skipped.");
+        return {};
+    }
+
+    const uint32_t indexCount = static_cast<uint32_t>(indices->valueCount());
+    if (indexCount < 2) return {};
+
+    // An odd count means the last index has no partner, and a LINE_LIST draw
+    // would read one past the end of the pairs. Drop the stray rather than
+    // refusing the whole outline.
+    const uint32_t lineIndexCount = indexCount - (indexCount % 2);
+
+    // Every index must be inside the position array. These come from the
+    // document, and Vulkan does not bounds-check an index buffer -- an
+    // out-of-range index is a read of whatever follows the vertex buffer on
+    // the GPU.
+    bool inRange = true;
+    const uint32_t vertexCount = static_cast<uint32_t>(positions->size());
+    if (auto u32 = indices.cast<vsg::uintArray>())
+    {
+        for (uint32_t i = 0; i < lineIndexCount && inRange; ++i)
+            if (u32->at(i) >= vertexCount) inRange = false;
+    }
+    else if (auto u16 = indices.cast<vsg::ushortArray>())
+    {
+        for (uint32_t i = 0; i < lineIndexCount && inRange; ++i)
+            if (u16->at(i) >= vertexCount) inRange = false;
+    }
+    if (!inRange)
+    {
+        vsg::warn("CESIUM_primitive_outline: an edge index is outside the ",
+                  vertexCount, " positions of its primitive; the outline is skipped.");
+        return {};
+    }
+
+    auto shaderSet = getOrCreateFlatShaderSet();
+    if (!shaderSet) return {};
+
+    auto config = vsg::GraphicsPipelineConfigurator::create(shaderSet);
+    if (options) config->assignInheritedState(options->inheritedState);
+
+    // Position from the primitive; everything else a single constant at
+    // INSTANCE rate, which is how the reader already supplies an attribute a
+    // model does not carry.
+    vsg::DataList vertexArrays;
+    config->assignArray(vertexArrays, "vsg_Vertex", VK_VERTEX_INPUT_RATE_VERTEX, positions);
+    config->assignArray(vertexArrays, "vsg_Normal", VK_VERTEX_INPUT_RATE_INSTANCE,
+                        vsg::vec3Value::create(vsg::vec3(0.0f, 0.0f, 1.0f)));
+    config->assignArray(vertexArrays, "vsg_TexCoord0", VK_VERTEX_INPUT_RATE_INSTANCE,
+                        vsg::vec2Value::create(vsg::vec2(0.0f, 0.0f)));
+    // Near-black rather than black: an edge should read as a drawn line, not as
+    // a hole in the model.
+    config->assignArray(vertexArrays, "vsg_Color", VK_VERTEX_INPUT_RATE_INSTANCE,
+                        vsg::vec4Value::create(vsg::vec4(0.05f, 0.05f, 0.05f, 1.0f)));
+
+    auto vid = vsg::VertexIndexDraw::create();
+    vid->assignArrays(vertexArrays);
+    vid->assignIndices(indices);
+    vid->indexCount = lineIndexCount;
+    vid->instanceCount = 1;
+
+    struct SetOutlineStates : public vsg::Visitor
+    {
+        void apply(vsg::Object& object) override { object.traverse(*this); }
+        void apply(vsg::InputAssemblyState& ias) override { ias.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; }
+        void apply(vsg::RasterizationState& rs) override
+        {
+            // The outline sits exactly on the surface it outlines, so half of
+            // every edge loses the depth test to the triangles that share it
+            // and the line comes out dashed. A small negative bias lifts it
+            // toward the eye. Rasterized wide enough to survive at a distance
+            // -- 1.0 is a single pixel and disappears the moment the model is
+            // more than a few metres away.
+            rs.cullMode = VK_CULL_MODE_NONE;
+            rs.depthBiasEnable = VK_TRUE;
+            rs.depthBiasConstantFactor = -1.0f;
+            rs.depthBiasSlopeFactor = -1.0f;
+            rs.lineWidth = 1.0f;
+        }
+    } sos;
+
+    config->accept(sos);
+
+    if (sharedObjects)
+        sharedObjects->share(config, [](auto gpc) { gpc->init(); });
+    else
+        config->init();
+
+    auto stateGroup = vsg::StateGroup::create();
+    config->copyTo(stateGroup, sharedObjects);
+    stateGroup->addChild(vid);
+
+    return stateGroup;
 }
 
 vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreatePointShaderSet()
