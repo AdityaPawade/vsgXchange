@@ -2268,6 +2268,7 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
     // it IS supported, so this list is deliberately short and specific.
     for (const auto& required : model->extensionsRequired.values)
     {
+#ifndef vsgXchange_meshoptimizer
         if (required == "EXT_meshopt_compression")
         {
             vsg::warn("glTF requires ", required,
@@ -2275,6 +2276,8 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
                       "with no geometry rather than fail, so it is refused.");
             return {};
         }
+#endif
+        (void)required;
     }
 
     if (in_options) options = in_options;

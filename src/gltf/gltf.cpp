@@ -12,6 +12,10 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 #include <vsgXchange/gltf.h>
 
+#ifdef vsgXchange_meshoptimizer
+#    include <meshoptimizer.h>
+#endif
+
 #include <vsg/io/Path.h>
 #include <vsg/io/mem_stream.h>
 #include <vsg/io/read.h>
@@ -741,6 +745,242 @@ void gltf::KHR_draco_mesh_compression::read_object(vsg::JSONParser& parser, cons
         parser.read_object(attributes);
     else
         ExtensionsExtras::read_object(parser, property);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// EXT_meshopt_compression
+//
+void gltf::EXT_meshopt_compression::report(vsg::LogOutput& output)
+{
+    output.enter("EXT_meshopt_compression {");
+    ExtensionsExtras::report(output);
+    output("buffer = ", buffer.value);
+    output("byteOffset = ", byteOffset);
+    output("byteLength = ", byteLength);
+    output("byteStride = ", byteStride);
+    output("count = ", count);
+    output("mode = ", mode);
+    output("filter = ", filter);
+    output.leave();
+}
+
+void gltf::EXT_meshopt_compression::read_string(vsg::JSONParser& parser, const std::string_view& property)
+{
+    if (property == "mode")
+        parser.read_string(mode);
+    else if (property == "filter")
+        parser.read_string(filter);
+    else
+        ExtensionsExtras::read_string(parser, property);
+}
+
+void gltf::EXT_meshopt_compression::read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input)
+{
+    if (property == "buffer")
+        input >> buffer;
+    else if (property == "byteOffset")
+        input >> byteOffset;
+    else if (property == "byteLength")
+        input >> byteLength;
+    else if (property == "byteStride")
+        input >> byteStride;
+    else if (property == "count")
+        input >> count;
+    else
+        parser.warning();
+}
+
+size_t gltf::glTF::decodeMeshopt()
+{
+    size_t decoded = 0;
+
+#ifdef vsgXchange_meshoptimizer
+
+    // A bufferView carrying the extension names two different places: its own
+    // buffer/byteOffset/byteLength, which is where the DECOMPRESSED bytes must
+    // end up, and the extension's, which is where the compressed bytes are now.
+    // The destination buffer is a "fallback" buffer -- declared with a
+    // byteLength and no uri, so nothing has allocated it. Allocate it here, on
+    // first use, and every accessor downstream then reads it as an ordinary
+    // buffer with no idea any of this happened.
+    auto fallbackStorage = [this](glTFid id) -> vsg::ref_ptr<vsg::ubyteArray> {
+        if (!id.valid() || id.value >= buffers.values.size()) return {};
+        auto& buffer = buffers.values[id.value];
+        if (!buffer || buffer->byteLength == 0) return {};
+
+        if (!buffer->data)
+        {
+            // Exactly the declared byteLength, never more. Growing it to fit a
+            // view that claims more than its buffer holds would paper over a
+            // document that disagrees with itself, and the bounds check below
+            // -- the one that actually protects the write -- would then never
+            // fire. Zero-filled, so a view that fails to decode leaves zeros
+            // rather than whatever was on the heap.
+            auto storage = vsg::ubyteArray::create(buffer->byteLength);
+            std::memset(storage->dataPointer(), 0, buffer->byteLength);
+            buffer->data = storage;
+        }
+        return buffer->data.cast<vsg::ubyteArray>();
+    };
+
+    for (size_t viewIndex = 0; viewIndex < bufferViews.values.size(); ++viewIndex)
+    {
+        auto& view = bufferViews.values[viewIndex];
+        if (!view) continue;
+
+        if (!view->extensions) continue;
+        auto itr = view->extensions->values.find("EXT_meshopt_compression");
+        if (itr == view->extensions->values.end() || !itr->second) continue;
+        auto meshopt = itr->second->cast<EXT_meshopt_compression>();
+        if (!meshopt) continue;
+
+        // ---- the compressed source ------------------------------------
+        if (!meshopt->buffer.valid() || meshopt->buffer.value >= buffers.values.size())
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex,
+                      " names buffer ", meshopt->buffer.value, ", which does not exist.");
+            continue;
+        }
+        auto& srcBuffer = buffers.values[meshopt->buffer.value];
+        if (!srcBuffer || !srcBuffer->data)
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex,
+                      " reads buffer ", meshopt->buffer.value, ", which was not loaded.");
+            continue;
+        }
+
+        const size_t srcTotal = srcBuffer->data->dataSize();
+        if (static_cast<size_t>(meshopt->byteOffset) + meshopt->byteLength > srcTotal)
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex, " reads ",
+                      meshopt->byteLength, " bytes at ", meshopt->byteOffset,
+                      " from a buffer of ", srcTotal, ".");
+            continue;
+        }
+        const unsigned char* src =
+            reinterpret_cast<const unsigned char*>(srcBuffer->data->dataPointer()) + meshopt->byteOffset;
+
+        // ---- the destination ------------------------------------------
+        //
+        // count * byteStride is what the decoder writes, and it must fit inside
+        // the window the bufferView claims. A document that disagrees with
+        // itself here would have the decoder write past the view and into the
+        // next one, so it is refused rather than clamped.
+        if (meshopt->count == 0 || meshopt->byteStride == 0)
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex,
+                      " has count ", meshopt->count, " and byteStride ", meshopt->byteStride,
+                      "; both must be non-zero.");
+            continue;
+        }
+        // Validate what the document CLAIMS before doing any work with it. The
+        // filter used to be checked after the decode, which made it
+        // unreachable whenever the payload was also bad -- so a view with both
+        // an unreadable payload and an unknown filter reported only the first,
+        // and the filter check could not be tested at all.
+        if (meshopt->mode != "ATTRIBUTES" && meshopt->mode != "TRIANGLES" && meshopt->mode != "INDICES")
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex,
+                      " uses unsupported mode \"", meshopt->mode, "\".");
+            continue;
+        }
+        if (!meshopt->filter.empty() && meshopt->filter != "NONE" &&
+            meshopt->filter != "OCTAHEDRAL" && meshopt->filter != "QUATERNION" &&
+            meshopt->filter != "EXPONENTIAL")
+        {
+            // Refused rather than ignored. The filters are lossy transforms
+            // applied BEFORE compression; leaving filtered bytes in place would
+            // hand the pipeline plausible-looking numbers that are not the
+            // model, which is worse than drawing nothing.
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex,
+                      " uses unsupported filter \"", meshopt->filter, "\".");
+            continue;
+        }
+
+        const size_t produced = static_cast<size_t>(meshopt->count) * meshopt->byteStride;
+        if (produced > view->byteLength)
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex, " would produce ",
+                      produced, " bytes into a view of ", view->byteLength, ".");
+            continue;
+        }
+
+        auto dstStorage = fallbackStorage(view->buffer);
+        if (!dstStorage)
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex,
+                      " has no storage to decompress into.");
+            continue;
+        }
+        if (static_cast<size_t>(view->byteOffset) + produced > dstStorage->dataSize())
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex, " would write ",
+                      produced, " bytes at ", view->byteOffset,
+                      " into a buffer of ", dstStorage->dataSize(), ".");
+            continue;
+        }
+        unsigned char* dst =
+            reinterpret_cast<unsigned char*>(dstStorage->dataPointer()) + view->byteOffset;
+
+        // ---- decode ----------------------------------------------------
+        int result = -1;
+        if (meshopt->mode == "ATTRIBUTES")
+        {
+            result = meshopt_decodeVertexBuffer(dst, meshopt->count, meshopt->byteStride,
+                                                src, meshopt->byteLength);
+        }
+        else if (meshopt->mode == "TRIANGLES")
+        {
+            result = meshopt_decodeIndexBuffer(dst, meshopt->count, meshopt->byteStride,
+                                               src, meshopt->byteLength);
+        }
+        else if (meshopt->mode == "INDICES")
+        {
+            result = meshopt_decodeIndexSequence(dst, meshopt->count, meshopt->byteStride,
+                                                 src, meshopt->byteLength);
+        }
+
+        if (result != 0)
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex,
+                      " failed to decode (mode ", meshopt->mode, ", meshoptimizer returned ",
+                      result, ").");
+            continue;
+        }
+
+        // ---- undo the filter -------------------------------------------
+        //
+        // The filters are lossy transforms applied BEFORE compression to make
+        // the data compress better; each one is reversed in place over the
+        // decompressed bytes. An unrecognised filter is refused rather than
+        // ignored: leaving filtered bytes in place would hand the pipeline
+        // plausible-looking numbers that are not the model.
+        if (meshopt->filter.empty() || meshopt->filter == "NONE")
+        {
+            // nothing to undo
+        }
+        else if (meshopt->filter == "OCTAHEDRAL")
+        {
+            meshopt_decodeFilterOct(dst, meshopt->count, meshopt->byteStride);
+        }
+        else if (meshopt->filter == "QUATERNION")
+        {
+            meshopt_decodeFilterQuat(dst, meshopt->count, meshopt->byteStride);
+        }
+        else if (meshopt->filter == "EXPONENTIAL")
+        {
+            meshopt_decodeFilterExp(dst, meshopt->count, meshopt->byteStride);
+        }
+
+        ++decoded;
+    }
+
+    if (decoded > 0) vsg::debug("EXT_meshopt_compression: decoded ", decoded, " bufferViews.");
+
+#endif
+
+    return decoded;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1591,6 +1831,11 @@ void gltf::glTF::resolveURIs(vsg::ref_ptr<const vsg::Options> options)
         }
         vsg::debug("Completed secondary single-threaded read/decode");
     }
+
+    // Every buffer is in memory now, which is the earliest this can run and the
+    // latest it may: accessors are resolved against bufferViews from here on,
+    // and a compressed view still holds its compressed bytes until this returns.
+    decodeMeshopt();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1977,6 +2222,7 @@ void gltf::assignExtensions(vsg::JSONParser& parser) const
     parser.setObject("KHR_materials_specular", KHR_materials_specular::create());
     parser.setObject("KHR_materials_ior", KHR_materials_ior::create());
     parser.setObject("EXT_mesh_gpu_instancing", EXT_mesh_gpu_instancing::create());
+    parser.setObject("EXT_meshopt_compression", EXT_meshopt_compression::create());
     parser.setObject("KHR_materials_unlit", KHR_materials_unlit::create());
     parser.setObject("KHR_texture_transform", KHR_texture_transform::create());
     parser.setObject("KHR_lights_punctual", KHR_lights_punctual::create());

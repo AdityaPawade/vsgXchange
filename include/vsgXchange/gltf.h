@@ -488,6 +488,31 @@ namespace vsgXchange
             void read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input) override;
         };
 
+        /// https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Vendor/EXT_meshopt_compression
+        ///
+        /// Sits on a bufferView and says "the bytes you want are not where the
+        /// bufferView points; they are over here, compressed". The bufferView's
+        /// own buffer is a FALLBACK buffer with no uri -- storage to decompress
+        /// into -- so nothing downstream needs to know this extension exists
+        /// once the decode has run.
+        struct VSGXCHANGE_DECLSPEC EXT_meshopt_compression : public vsg::Inherit<ExtensionsExtras, EXT_meshopt_compression>
+        {
+            glTFid buffer;                  // the COMPRESSED source
+            uint32_t byteOffset = 0;
+            uint32_t byteLength = 0;
+            uint32_t byteStride = 0;
+            uint32_t count = 0;
+            std::string mode;               // ATTRIBUTES | TRIANGLES | INDICES
+            std::string filter;             // NONE | OCTAHEDRAL | QUATERNION | EXPONENTIAL
+
+            // extention prototype will be cloned when it's used.
+            vsg::ref_ptr<vsg::Object> clone(const vsg::CopyOp&) const override { return EXT_meshopt_compression::create(*this); }
+
+            void report(vsg::LogOutput& output);
+            void read_string(vsg::JSONParser& parser, const std::string_view& property) override;
+            void read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input) override;
+        };
+
         /// https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Vendor/EXT_mesh_gpu_instancing/README.md
         struct VSGXCHANGE_DECLSPEC EXT_mesh_gpu_instancing : public vsg::Inherit<ExtensionsExtras, EXT_mesh_gpu_instancing>
         {
@@ -674,6 +699,14 @@ namespace vsgXchange
             void report(vsg::LogOutput& output);
 
             virtual void resolveURIs(vsg::ref_ptr<const vsg::Options> options);
+
+            /// Decompress every bufferView carrying EXT_meshopt_compression.
+            ///
+            /// Runs at the end of resolveURIs, once the compressed buffers are
+            /// in memory and before anything reads an accessor. Returns the
+            /// number of views decoded; 0 with no warning simply means the
+            /// document did not use the extension.
+            size_t decodeMeshopt();
         };
 
         class VSGXCHANGE_DECLSPEC SceneGraphBuilder : public vsg::Inherit<vsg::Object, SceneGraphBuilder>
