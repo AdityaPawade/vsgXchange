@@ -197,6 +197,40 @@ namespace
 
     /// Widen any integer vertex array to float, or return null if it is
     /// already float (or is a type this does not apply to).
+    //! Is every index inside the vertex array it addresses?
+    //!
+    //! Vulkan does not bounds-check an index buffer. An index at or past the
+    //! vertex count reads whatever follows the vertex data on the GPU, and the
+    //! indices come from the document, so this is the ordinary hostile case
+    //! rather than an exotic one -- the same check createPrimitiveOutline
+    //! already makes for the outline's own indices.
+    //!
+    //! Linear in the index count, which is the cheapest it can be: the answer
+    //! depends on every element. Measured against the corpus it is not visible
+    //! beside the decode that produced the array.
+    bool indicesAreInRange(const vsg::ref_ptr<vsg::Data>& indices, uint32_t vertexCount,
+                           uint32_t& out_offender)
+    {
+        if (!indices) return true;
+
+        if (auto u32 = indices.cast<vsg::uintArray>())
+        {
+            for (auto v : *u32)
+                if (v >= vertexCount) { out_offender = v; return false; }
+        }
+        else if (auto u16 = indices.cast<vsg::ushortArray>())
+        {
+            for (auto v : *u16)
+                if (v >= vertexCount) { out_offender = v; return false; }
+        }
+        else if (auto u8 = indices.cast<vsg::ubyteArray>())
+        {
+            for (auto v : *u8)
+                if (v >= vertexCount) { out_offender = v; return false; }
+        }
+        return true;
+    }
+
     //! Give a vertex array the VkFormat its own type implies.
     //!
     //! vsg::Data::Properties::format defaults to VK_FORMAT_UNDEFINED, and
@@ -1287,6 +1321,17 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
                     return {};
                 }
 
+                {
+                    uint32_t offender = 0;
+                    if (!indicesAreInRange(indices, vertexCount, offender))
+                    {
+                        vsg::warn("gltf: a primitive's index ", offender, " is outside its ",
+                                  vertexCount, " vertices; the primitive is skipped rather "
+                                  "than drawn from memory past the end of the array.");
+                        continue;
+                    }
+                }
+
                 if (auto ubyte_indices = indices.cast<vsg::ubyteArray>())
                 {
                     // need to promote ubyte indices to ushort as Vulkan requires an extension to be enabled for ubyte indices.
@@ -1330,6 +1375,17 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
             {
                 vsg::warn("gltf::SceneGraphBuilder::createMesh() error required indices array null.");
                 return {};
+            }
+
+            {
+                uint32_t offender = 0;
+                if (!indicesAreInRange(indices, vertexCount, offender))
+                {
+                    vsg::warn("gltf: a primitive's index ", offender, " is outside its ",
+                              vertexCount, " vertices; the primitive is skipped rather "
+                              "than drawn from memory past the end of the array.");
+                    continue;
+                }
             }
 
             if (auto ubyte_indices = indices.cast<vsg::ubyteArray>())
