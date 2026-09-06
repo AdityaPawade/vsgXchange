@@ -926,7 +926,8 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
         if (primitive->mode < (sizeof(topologyLookup) / sizeof(topologyLookup[0])) &&
             topologyLookup[primitive->mode] == VK_PRIMITIVE_TOPOLOGY_POINT_LIST)
         {
-            if (auto points = getOrCreatePointShaderSet()) shaderSetForPrimitive = points;
+            if (auto points = getOrCreatePointShaderSet(vsg_material->shaderSet))
+                shaderSetForPrimitive = points;
         }
 
         auto config = vsg::GraphicsPipelineConfigurator::create(shaderSetForPrimitive);
@@ -2352,20 +2353,20 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createPrimitiveOutline(
     return stateGroup;
 }
 
-vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreatePointShaderSet()
+vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreatePointShaderSet(vsg::ref_ptr<vsg::ShaderSet> source)
 {
-    if (pointShaderSet) return pointShaderSet;
+    if (!source) source = vsg::createFlatShadedShaderSet(options);
+    if (!source) return {};
 
-    auto flat = vsg::createFlatShadedShaderSet(options);
-    if (!flat)
-    {
-        return {};
-    }
+    if (auto itr = pointShaderSets.find(source.get()); itr != pointShaderSets.end())
+        return itr->second;
 
-    // Clone before patching. The flat set is shared -- vsg::SharedObjects hands
-    // the same instance to every unlit material in the scene -- so editing it
-    // in place would give every unlit TRIANGLE a point size too, and change
-    // meshes that have nothing to do with this.
+    auto flat = source;
+
+    // Clone before patching. Shader sets are shared -- vsg::SharedObjects hands
+    // the same instance to every material of that kind in the scene -- so
+    // editing one in place would give every TRIANGLE using it a point size too,
+    // and change meshes that have nothing to do with this.
     auto patched = vsg::ShaderSet::create();
     patched->stages = flat->stages;
     patched->attributeBindings = flat->attributeBindings;
@@ -2445,14 +2446,14 @@ vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreatePointShaderSet(
     if (!patchedAStage)
     {
         // Nothing to gain and something to lose: hand back the original.
-        pointShaderSet = flat;
-        return pointShaderSet;
+        pointShaderSets[source.get()] = source;
+        return source;
     }
 
     if (sharedObjects) sharedObjects->share(patched);
 
-    pointShaderSet = patched;
-    return pointShaderSet;
+    pointShaderSets[source.get()] = patched;
+    return patched;
 }
 
 vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreateFlatShaderSet()
@@ -2482,15 +2483,29 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
     // it IS supported, so this list is deliberately short and specific.
     for (const auto& required : model->extensionsRequired.values)
     {
-#ifndef vsgXchange_meshoptimizer
         if (required == "EXT_meshopt_compression")
         {
+#ifndef vsgXchange_meshoptimizer
             vsg::warn("glTF requires ", required,
                       ", which this build cannot decode -- the model would load "
                       "with no geometry rather than fail, so it is refused.");
             return {};
-        }
+#else
+            // Decoded, but not all of it. The undecoded views are zero-filled,
+            // so proceeding would hand the pipeline zeros where positions and
+            // indices should be -- a model that draws, wrongly, and reports
+            // success. When the document says it REQUIRES this extension, a
+            // partial decode is a failed read.
+            if (model->meshoptDecodeFailed)
+            {
+                vsg::warn("glTF requires ", required,
+                          ", and at least one compressed bufferView could not be "
+                          "decoded; the undecoded views hold zeros, so the model is "
+                          "refused rather than drawn from them.");
+                return {};
+            }
 #endif
+        }
         (void)required;
     }
 

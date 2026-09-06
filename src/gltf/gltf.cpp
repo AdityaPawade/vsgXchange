@@ -814,6 +814,7 @@ void gltf::EXT_meshopt_compression::read_number(vsg::JSONParser& parser, const s
 size_t gltf::glTF::decodeMeshopt()
 {
     size_t decoded = 0;
+    size_t seen = 0;
 
 #ifdef vsgXchange_meshoptimizer
 
@@ -824,13 +825,39 @@ size_t gltf::glTF::decodeMeshopt()
     // byteLength and no uri, so nothing has allocated it. Allocate it here, on
     // first use, and every accessor downstream then reads it as an ordinary
     // buffer with no idea any of this happened.
-    auto fallbackStorage = [this](glTFid id) -> vsg::ref_ptr<vsg::ubyteArray> {
+    // A fallback buffer's size comes from the document and nothing else -- it
+    // has no uri, so no fetched payload bounds it the way an ordinary buffer's
+    // does. A 200-byte JSON can therefore declare byteLength 4294967295 and ask
+    // for a 4 GiB zero-filled allocation, and declare several of them.
+    //
+    // 256 MB per buffer and 512 MB across the document. BrainStem, the largest
+    // meshopt model in either corpus, decompresses into 136 KB, so this is
+    // three orders of magnitude of headroom and still refuses the 4 GiB claim.
+    constexpr size_t MAX_FALLBACK_BYTES = 256u * 1024u * 1024u;
+    constexpr size_t MAX_FALLBACK_TOTAL = 512u * 1024u * 1024u;
+    size_t fallbackAllocated = 0;
+
+    auto fallbackStorage = [&](glTFid id) -> vsg::ref_ptr<vsg::ubyteArray> {
         if (!id.valid() || id.value >= buffers.values.size()) return {};
         auto& buffer = buffers.values[id.value];
         if (!buffer || buffer->byteLength == 0) return {};
 
         if (!buffer->data)
         {
+            if (buffer->byteLength > MAX_FALLBACK_BYTES)
+            {
+                vsg::warn("EXT_meshopt_compression: buffer ", id.value, " declares ",
+                          buffer->byteLength, " bytes of fallback storage, above the ",
+                          MAX_FALLBACK_BYTES, " byte limit; it is not allocated.");
+                return {};
+            }
+            if (fallbackAllocated + buffer->byteLength > MAX_FALLBACK_TOTAL)
+            {
+                vsg::warn("EXT_meshopt_compression: allocating buffer ", id.value, " (",
+                          buffer->byteLength, " bytes) would take this document past the ",
+                          MAX_FALLBACK_TOTAL, " byte total; it is not allocated.");
+                return {};
+            }
             // Exactly the declared byteLength, never more. Growing it to fit a
             // view that claims more than its buffer holds would paper over a
             // document that disagrees with itself, and the bounds check below
@@ -840,6 +867,7 @@ size_t gltf::glTF::decodeMeshopt()
             auto storage = vsg::ubyteArray::create(buffer->byteLength);
             std::memset(storage->dataPointer(), 0, buffer->byteLength);
             buffer->data = storage;
+            fallbackAllocated += buffer->byteLength;
         }
         return buffer->data.cast<vsg::ubyteArray>();
     };
@@ -854,6 +882,11 @@ size_t gltf::glTF::decodeMeshopt()
         if (itr == view->extensions->values.end() || !itr->second) continue;
         auto meshopt = itr->second->cast<EXT_meshopt_compression>();
         if (!meshopt) continue;
+
+        // Counted here, before any refusal. Comparing this against `decoded` at
+        // the end is what makes "every view was decoded" impossible to get
+        // wrong: a `continue` added later cannot forget to mark the failure.
+        ++seen;
 
         // ---- the compressed source ------------------------------------
         if (!meshopt->buffer.valid() || meshopt->buffer.value >= buffers.values.size())
@@ -905,6 +938,26 @@ size_t gltf::glTF::decodeMeshopt()
                       " uses unsupported mode \"", meshopt->mode, "\".");
             continue;
         }
+        // meshoptimizer.h states each filter's required stride, and the
+        // filters do NOT re-derive the element size from it -- decodeFilterOct
+        // treats the buffer as 4- or 8-byte elements whatever it is told. So a
+        // document declaring OCTAHEDRAL with byteStride 1 and count 1 passes
+        // the count * byteStride check above at one byte and then has four
+        // written into it. The asserts that would catch this are compiled out
+        // of a release meshoptimizer.
+        const bool filterStrideOk =
+            (meshopt->filter == "OCTAHEDRAL")  ? (meshopt->byteStride == 4 || meshopt->byteStride == 8) :
+            (meshopt->filter == "QUATERNION")  ? (meshopt->byteStride == 8) :
+            (meshopt->filter == "EXPONENTIAL") ? (meshopt->byteStride % 4 == 0) : true;
+        if (!filterStrideOk)
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex, " uses filter \"",
+                      meshopt->filter, "\" with byteStride ", meshopt->byteStride,
+                      ", which that filter does not accept (OCTAHEDRAL needs 4 or 8, "
+                      "QUATERNION needs 8, EXPONENTIAL needs a multiple of 4).");
+            continue;
+        }
+
         if (!meshopt->filter.empty() && meshopt->filter != "NONE" &&
             meshopt->filter != "OCTAHEDRAL" && meshopt->filter != "QUATERNION" &&
             meshopt->filter != "EXPONENTIAL")
@@ -997,6 +1050,21 @@ size_t gltf::glTF::decodeMeshopt()
     }
 
     if (decoded > 0) vsg::debug("EXT_meshopt_compression: decoded ", decoded, " bufferViews.");
+
+    // Record a partial decode on the model.
+    //
+    // The fallback storage is zero-filled, so a view that could not be decoded
+    // does not disappear -- it becomes an accessor full of zeros, and every
+    // position and index downstream reads those zeros as data. That is silent
+    // corruption, and it is strictly worse than the by-name refusal this
+    // extension used to get. createSceneGraph() refuses the document when the
+    // extension is REQUIRED and this is set.
+    if (decoded != seen)
+    {
+        meshoptDecodeFailed = true;
+        vsg::warn("EXT_meshopt_compression: decoded ", decoded, " of ", seen,
+                  " compressed bufferViews; the rest hold zeros.");
+    }
 
 #endif
 

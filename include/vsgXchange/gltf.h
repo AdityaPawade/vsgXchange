@@ -724,6 +724,15 @@ namespace vsgXchange
             /// number of views decoded; 0 with no warning simply means the
             /// document did not use the extension.
             size_t decodeMeshopt();
+
+            /// Set when decodeMeshopt() could not decode every compressed view.
+            ///
+            /// Not an error on its own -- a document may use the extension
+            /// without requiring it. It becomes one in createSceneGraph() when
+            /// EXT_meshopt_compression is in extensionsRequired, because the
+            /// undecoded views are zero-filled and would otherwise be read as
+            /// geometry.
+            bool meshoptDecodeFailed = false;
         };
 
         class VSGXCHANGE_DECLSPEC SceneGraphBuilder : public vsg::Inherit<vsg::Object, SceneGraphBuilder>
@@ -740,7 +749,7 @@ namespace vsgXchange
             vsg::ref_ptr<const vsg::Options> options;
             vsg::ref_ptr<vsg::ShaderSet> flatShaderSet;
             vsg::ref_ptr<vsg::ShaderSet> pbrShaderSet;
-            vsg::ref_ptr<vsg::ShaderSet> pointShaderSet;
+            std::map<const vsg::ShaderSet*, vsg::ref_ptr<vsg::ShaderSet>> pointShaderSets;
             vsg::ref_ptr<vsg::SharedObjects> sharedObjects;
 
             vsg::CoordinateConvention source_coordinateConvention = vsg::CoordinateConvention::Y_UP;
@@ -847,7 +856,7 @@ namespace vsgXchange
             vsg::ref_ptr<vsg::ShaderSet> getOrCreatePbrShaderSet();
             vsg::ref_ptr<vsg::ShaderSet> getOrCreateFlatShaderSet();
 
-            /// The flat shader set, with a usable gl_PointSize.
+            /// `source`, with a usable gl_PointSize.
             ///
             /// Vulkan takes a point's size from gl_PointSize in the vertex
             /// shader and nowhere else. VSG's flat shader already has the
@@ -863,7 +872,13 @@ namespace vsgXchange
             vsg::ref_ptr<vsg::Node> createPrimitiveOutline(vsg::ref_ptr<Primitive> primitive,
                                                            const CESIUM_primitive_outline& outline);
 
-            vsg::ref_ptr<vsg::ShaderSet> getOrCreatePointShaderSet();
+            /// Derived from the primitive's OWN shader set rather than always
+            /// from the flat one, and cached per source: a POINTS primitive
+            /// with a PBR material keeps its PBR shading, its textures and its
+            /// descriptor bindings, and only gains a point size. Substituting
+            /// the flat set here would silently render such a primitive with
+            /// flat semantics against a PBR descriptor configurator.
+            vsg::ref_ptr<vsg::ShaderSet> getOrCreatePointShaderSet(vsg::ref_ptr<vsg::ShaderSet> source);
 
             vsg::ref_ptr<vsg::Object> createSceneGraph(vsg::ref_ptr<gltf::glTF> in_model, vsg::ref_ptr<const vsg::Options> in_options);
         };
