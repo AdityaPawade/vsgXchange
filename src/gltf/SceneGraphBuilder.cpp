@@ -2175,8 +2175,31 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createPrimitiveOutline(
     if (position_itr == primitive->attributes.values.end()) return {};
     if (!position_itr->second.valid() || position_itr->second.value >= vsg_accessors.size()) return {};
 
-    auto positions = vsg_accessors[position_itr->second.value].cast<vsg::vec3Array>();
-    if (!positions || positions->empty()) return {};
+    auto positionData = vsg_accessors[position_itr->second.value];
+    if (!positionData) return {};
+
+    // KHR_mesh_quantization stores POSITION as byte or short, and the widening
+    // the mesh path does is to a LOCAL copy -- vsg_accessors still holds the
+    // integer array. Casting straight to vec3Array therefore returns null for
+    // every quantized model, and the outline would vanish with no message on
+    // exactly the models most likely to have one, since quantization is what
+    // mesh optimizers emit. Widen it here the same way.
+    if (auto widened = widenQuantizedAttribute(
+            positionData,
+            position_itr->second.value < model->accessors.values.size() &&
+                model->accessors.values[position_itr->second.value]->normalized))
+    {
+        positionData = widened;
+    }
+
+    auto positions = positionData.cast<vsg::vec3Array>();
+    if (!positions || positions->empty())
+    {
+        vsg::warn("CESIUM_primitive_outline: POSITION is ",
+                  positionData->className(), ", which the outline cannot use; "
+                  "the outline is skipped.");
+        return {};
+    }
 
     if (!outline.indices.valid() || outline.indices.value >= vsg_accessors.size()) return {};
     auto rawIndices = vsg_accessors[outline.indices.value];
