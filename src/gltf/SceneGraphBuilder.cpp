@@ -145,6 +145,92 @@ vsg::ref_ptr<vsg::Data> gltf::SceneGraphBuilder::createBufferView(vsg::ref_ptr<g
     return vsg_buffer;
 }
 
+namespace
+{
+    /// KHR_mesh_quantization: a vertex attribute stored as integers.
+    ///
+    /// POSITION, NORMAL, TANGENT and TEXCOORD_n are normally float, and the
+    /// extension lets them be byte or short instead -- which halves or quarters
+    /// the file and is what every mesh optimizer emits. The values are brought
+    /// back by the node's own scale and translation, which the reader already
+    /// applies, so all that is needed here is to widen the components.
+    ///
+    /// Without this the array reaches the pipeline as a usvec3Array where the
+    /// shader set declares a float vec3, and the primitive is dropped: the
+    /// model loads, converts, and contains no geometry at all. Six of the 292
+    /// models in glTF-Sample-Assets were empty for this reason, Duck and
+    /// Lantern among them.
+    ///
+    /// `normalized` is the accessor's own flag and decides the mapping: the
+    /// glTF spec's c/255, c/65535, max(c/127, -1) and max(c/32767, -1). An
+    /// un-normalized quantized value is used as-is.
+    template<typename SourceArray, typename DestArray, typename DestValue>
+    vsg::ref_ptr<vsg::Data> widenComponents(const vsg::ref_ptr<vsg::Data>& in,
+                                            bool normalized, double divisor,
+                                            bool clampToMinusOne)
+    {
+        auto source = in.cast<SourceArray>();
+        if (!source) return {};
+
+        auto dest = DestArray::create(source->size());
+        auto out = dest->begin();
+        for (auto& v : *source)
+        {
+            DestValue& d = *(out++);
+            for (std::size_t c = 0; c < d.size(); ++c)
+            {
+                double value = static_cast<double>(v[c]);
+                if (normalized)
+                {
+                    value /= divisor;
+                    if (clampToMinusOne && value < -1.0) value = -1.0;
+                }
+                d[c] = static_cast<float>(value);
+            }
+        }
+        return dest;
+    }
+
+    /// Widen any integer vertex array to float, or return null if it is
+    /// already float (or is a type this does not apply to).
+    vsg::ref_ptr<vsg::Data> widenQuantizedAttribute(const vsg::ref_ptr<vsg::Data>& array,
+                                                    bool normalized)
+    {
+        if (!array) return {};
+
+        // Already float: nothing to do, and saying so by returning null keeps
+        // the caller's "did I change it" test to one check.
+        if (array.cast<vsg::vec2Array>() || array.cast<vsg::vec3Array>() ||
+            array.cast<vsg::vec4Array>())
+        {
+            return {};
+        }
+
+        vsg::ref_ptr<vsg::Data> result;
+
+        // unsigned byte -> /255,  byte -> /127 clamped, unsigned short -> /65535,
+        // short -> /32767 clamped.  glTF 2.0, "Animation Sampler" table and
+        // KHR_mesh_quantization.
+        if ((result = widenComponents<vsg::ubvec2Array, vsg::vec2Array, vsg::vec2>(array, normalized, 255.0, false))) return result;
+        if ((result = widenComponents<vsg::ubvec3Array, vsg::vec3Array, vsg::vec3>(array, normalized, 255.0, false))) return result;
+        if ((result = widenComponents<vsg::ubvec4Array, vsg::vec4Array, vsg::vec4>(array, normalized, 255.0, false))) return result;
+
+        if ((result = widenComponents<vsg::bvec2Array, vsg::vec2Array, vsg::vec2>(array, normalized, 127.0, true))) return result;
+        if ((result = widenComponents<vsg::bvec3Array, vsg::vec3Array, vsg::vec3>(array, normalized, 127.0, true))) return result;
+        if ((result = widenComponents<vsg::bvec4Array, vsg::vec4Array, vsg::vec4>(array, normalized, 127.0, true))) return result;
+
+        if ((result = widenComponents<vsg::usvec2Array, vsg::vec2Array, vsg::vec2>(array, normalized, 65535.0, false))) return result;
+        if ((result = widenComponents<vsg::usvec3Array, vsg::vec3Array, vsg::vec3>(array, normalized, 65535.0, false))) return result;
+        if ((result = widenComponents<vsg::usvec4Array, vsg::vec4Array, vsg::vec4>(array, normalized, 65535.0, false))) return result;
+
+        if ((result = widenComponents<vsg::svec2Array, vsg::vec2Array, vsg::vec2>(array, normalized, 32767.0, true))) return result;
+        if ((result = widenComponents<vsg::svec3Array, vsg::vec3Array, vsg::vec3>(array, normalized, 32767.0, true))) return result;
+        if ((result = widenComponents<vsg::svec4Array, vsg::vec4Array, vsg::vec4>(array, normalized, 32767.0, true))) return result;
+
+        return {};
+    }
+}
+
 vsg::ref_ptr<vsg::Data> gltf::SceneGraphBuilder::createArray(const std::string& type, uint32_t componentType, glTFid bufferView, uint32_t offset, uint32_t count)
 {
     vsg::ref_ptr<vsg::Data> vsg_data;
@@ -891,6 +977,18 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
             }
             else if (attribute_name == "TEXCOORD_0" || attribute_name == "TEXCOORD_1" || attribute_name == "TEXCOORD_2" || attribute_name == "TEXCOORD_3")
             {
+                // Widen first: a quantized texcoord arrives as usvec2 and the
+                // transform below is written in floats, so doing it the other
+                // way round silently skips the transform on quantized meshes.
+                {
+                    const bool normalized =
+                        array_itr->second.value < model->accessors.values.size() &&
+                        model->accessors.values[array_itr->second.value]->normalized;
+
+                    if (auto widened = widenQuantizedAttribute(array, normalized))
+                        array = widened;
+                }
+
                 if (auto texture_transform = vsg_material->getObject<KHR_texture_transform>("KHR_texture_transform"))
                 {
                     vsg::vec2 offset(0.0f, 0.0f);
@@ -914,6 +1012,18 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
                         array = transformedTexCoords;
                     }
                 }
+            }
+            else if (attribute_name == "POSITION" || attribute_name == "NORMAL" ||
+                     attribute_name == "TANGENT")
+            {
+                // KHR_mesh_quantization. TEXCOORD_n is handled above, before
+                // the texture transform, since that works in floats.
+                const bool normalized =
+                    array_itr->second.value < model->accessors.values.size() &&
+                    model->accessors.values[array_itr->second.value]->normalized;
+
+                if (auto widened = widenQuantizedAttribute(array, normalized))
+                    array = widened;
             }
             else if (attribute_name == "JOINTS_0")
             {
@@ -2024,6 +2134,27 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
 {
     model = in_model;
     if (!model) return {};
+
+    // extensionsRequired means what it says: the document cannot be read
+    // correctly without it. A codec is the case that matters -- the geometry is
+    // not merely differently shaped, it is not there in a form anything here
+    // can read, so the primitive is dropped and the model loads as an empty
+    // scene that reports success. Two of the 292 models in glTF-Sample-Assets
+    // were exactly that.
+    //
+    // Named here rather than silently, and only for what genuinely blocks the
+    // read: KHR_mesh_quantization is required by six of those models too, and
+    // it IS supported, so this list is deliberately short and specific.
+    for (const auto& required : model->extensionsRequired.values)
+    {
+        if (required == "EXT_meshopt_compression")
+        {
+            vsg::warn("glTF requires ", required,
+                      ", which this build cannot decode -- the model would load "
+                      "with no geometry rather than fail, so it is refused.");
+            return {};
+        }
+    }
 
     if (in_options) options = in_options;
 
