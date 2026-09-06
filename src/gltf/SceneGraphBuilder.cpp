@@ -21,6 +21,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 </editor-fold> */
 
+#include <set>
+
 #include <vsgXchange/gltf.h>
 
 #include <vsg/animation/AnimationGroup.h>
@@ -193,6 +195,52 @@ namespace
 
     /// Widen any integer vertex array to float, or return null if it is
     /// already float (or is a type this does not apply to).
+    //! Give a vertex array the VkFormat its own type implies.
+    //!
+    //! vsg::Data::Properties::format defaults to VK_FORMAT_UNDEFINED, and
+    //! GraphicsPipelineConfigurator::assignArray falls back to the SHADER's
+    //! declared format when it finds one:
+    //!
+    //!     (format != VK_FORMAT_UNDEFINED) ? format : binding.format
+    //!
+    //! while taking the stride from the array. So an array narrower than the
+    //! attribute the shader declares gets the shader's format at the array's
+    //! stride, and Vulkan then reads more bytes per vertex than the stride
+    //! advances.
+    //!
+    //! glTF's COLOR_0 may be VEC3 or VEC4 and vsg_Color is declared vec4, so a
+    //! VEC3 COLOR_0 was bound as R32G32B32A32_SFLOAT -- 16 bytes -- at a stride
+    //! of 12. Every vertex took its alpha from the next vertex's red channel,
+    //! and the last vertex read four bytes past the end of the buffer. Nine
+    //! documents across the two corpora do this, including both point clouds in
+    //! the gallery.
+    //!
+    //! Setting the format from the array is also what the spec asks for: a
+    //! vertex attribute with fewer components than the shader declares has the
+    //! missing ones filled with (0, 0, 0, 1), which is exactly the alpha of 1.0
+    //! glTF requires for a VEC3 COLOR_0.
+    void setVertexFormatFromType(const vsg::ref_ptr<vsg::Data>& array)
+    {
+        if (!array || array->properties.format != VK_FORMAT_UNDEFINED) return;
+
+        VkFormat format = VK_FORMAT_UNDEFINED;
+
+        if (array.cast<vsg::floatArray>())        format = VK_FORMAT_R32_SFLOAT;
+        else if (array.cast<vsg::vec2Array>())    format = VK_FORMAT_R32G32_SFLOAT;
+        else if (array.cast<vsg::vec3Array>())    format = VK_FORMAT_R32G32B32_SFLOAT;
+        else if (array.cast<vsg::vec4Array>())    format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        else if (array.cast<vsg::ivec4Array>())   format = VK_FORMAT_R32G32B32A32_SINT;
+        else if (array.cast<vsg::uivec4Array>())  format = VK_FORMAT_R32G32B32A32_UINT;
+        else if (array.cast<vsg::usvec4Array>())  format = VK_FORMAT_R16G16B16A16_UINT;
+        else if (array.cast<vsg::ubvec4Array>())  format = VK_FORMAT_R8G8B8A8_UINT;
+
+        // Anything else keeps UNDEFINED and the previous behaviour. Narrowing
+        // the fix to the types this reader actually produces for a vertex
+        // attribute is deliberate: guessing a format for a type we do not
+        // recognise would replace a known-wrong binding with an unknown one.
+        if (format != VK_FORMAT_UNDEFINED) array->properties.format = format;
+    }
+
     vsg::ref_ptr<vsg::Data> widenQuantizedAttribute(const vsg::ref_ptr<vsg::Data>& array,
                                                     bool normalized)
     {
@@ -1070,6 +1118,7 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
                 }
             }
 
+            setVertexFormatFromType(array);
             config->assignArray(vertexArrays, name_itr->second, vertexInputRate, array);
             return true;
         };
@@ -2381,7 +2430,7 @@ vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreatePointShaderSet(
     if (!source) source = vsg::createFlatShadedShaderSet(options);
     if (!source) return {};
 
-    if (auto itr = pointShaderSets.find(source.get()); itr != pointShaderSets.end())
+    if (auto itr = pointShaderSets.find(source); itr != pointShaderSets.end())
         return itr->second;
 
     auto flat = source;
@@ -2469,13 +2518,13 @@ vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreatePointShaderSet(
     if (!patchedAStage)
     {
         // Nothing to gain and something to lose: hand back the original.
-        pointShaderSets[source.get()] = source;
+        pointShaderSets[source] = source;
         return source;
     }
 
     if (sharedObjects) sharedObjects->share(patched);
 
-    pointShaderSets[source.get()] = patched;
+    pointShaderSets[source] = patched;
     return patched;
 }
 
@@ -2504,16 +2553,76 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
     // Named here rather than silently, and only for what genuinely blocks the
     // read: KHR_mesh_quantization is required by six of those models too, and
     // it IS supported, so this list is deliberately short and specific.
+    // glTF 2.0, 3.2: "If a loader does not support an extension listed in
+    // extensionsRequired, it MUST fail to load the asset." Until now this loop
+    // enforced that for exactly one extension, so a document requiring anything
+    // else -- a geometry codec we do not have, or one that does not exist yet --
+    // loaded and reported success with whatever the reader happened to salvage.
+    //
+    // The rule is applied here in two grades rather than one, and the split is
+    // deliberate:
+    //
+    //   fullySupported   we implement it, so the document loads.
+    //
+    //   appearanceOnly   we do not implement it, but it changes only how a
+    //                    surface LOOKS. The vertices, indices and transforms
+    //                    are untouched, so the model is the right model, drawn
+    //                    without a sheen term or a clearcoat layer. Refusing a
+    //                    whole city model over that serves nobody, and the
+    //                    warning says what was dropped.
+    //
+    //   anything else    refused. An unknown extension is unknown: it may be
+    //                    the next mesh codec, in which case loading it means
+    //                    drawing a model that is missing or wrong while
+    //                    reporting success. That is the failure this whole
+    //                    session has been about.
+    //
+    // Measured against the corpora before it was written: 396 documents declare
+    // 14 distinct extensions between them under extensionsRequired, and all 14
+    // are named below -- so this refuses nothing that works today. What it
+    // refuses is the fifteenth.
+    static const std::set<std::string> fullySupported = {
+        "KHR_mesh_quantization",
+        "KHR_texture_transform",
+        "KHR_lights_punctual",
+        "KHR_materials_unlit",
+        "KHR_materials_specular",
+        "KHR_materials_ior",
+        "KHR_materials_pbrSpecularGlossiness",
+        "KHR_materials_emissive_strength",
+        "EXT_mesh_gpu_instancing",
+        "CESIUM_primitive_outline",
+#ifdef vsgXchange_draco
+        "KHR_draco_mesh_compression",
+#endif
+#ifdef vsgXchange_meshoptimizer
+        "EXT_meshopt_compression",
+#endif
+    };
+
+    static const std::set<std::string> appearanceOnly = {
+        // Material models we do not implement. Each one changes shading and
+        // nothing else -- no attribute, no index, no transform.
+        "KHR_materials_sheen",
+        "KHR_materials_clearcoat",
+        "KHR_materials_iridescence",
+        "KHR_materials_anisotropy",
+        "KHR_materials_transmission",
+        "KHR_materials_volume",
+        "KHR_materials_variants",
+        "KHR_materials_dispersion",
+        // Texture container formats. An unreadable texture leaves the surface
+        // untextured; the geometry underneath it is unaffected.
+        "KHR_texture_basisu",
+        "EXT_texture_webp",
+        "EXT_texture_avif",
+    };
+
     for (const auto& required : model->extensionsRequired.values)
     {
         if (required == "EXT_meshopt_compression")
         {
-#ifndef vsgXchange_meshoptimizer
-            vsg::warn("glTF requires ", required,
-                      ", which this build cannot decode -- the model would load "
-                      "with no geometry rather than fail, so it is refused.");
-            return {};
-#else
+#ifdef vsgXchange_meshoptimizer
             // Decoded, but not all of it. The undecoded views are zero-filled,
             // so proceeding would hand the pipeline zeros where positions and
             // indices should be -- a model that draws, wrongly, and reports
@@ -2529,7 +2638,24 @@ vsg::ref_ptr<vsg::Object> gltf::SceneGraphBuilder::createSceneGraph(vsg::ref_ptr
             }
 #endif
         }
-        (void)required;
+
+        if (fullySupported.count(required) != 0) continue;
+
+        if (appearanceOnly.count(required) != 0)
+        {
+            vsg::warn("glTF requires ", required,
+                      ", which this reader does not implement. It affects only how "
+                      "the surface is shaded, so the model is loaded without it "
+                      "rather than refused.");
+            continue;
+        }
+
+        vsg::warn("glTF requires ", required,
+                  ", which this reader does not implement and cannot assume is "
+                  "harmless -- an unknown extension may be the one that holds the "
+                  "geometry. The document is refused rather than drawn from "
+                  "whatever could be salvaged.");
+        return {};
     }
 
     if (in_options) options = in_options;

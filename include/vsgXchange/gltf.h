@@ -749,7 +749,10 @@ namespace vsgXchange
             vsg::ref_ptr<const vsg::Options> options;
             vsg::ref_ptr<vsg::ShaderSet> flatShaderSet;
             vsg::ref_ptr<vsg::ShaderSet> pbrShaderSet;
-            std::map<const vsg::ShaderSet*, vsg::ref_ptr<vsg::ShaderSet>> pointShaderSets;
+            /// Keyed by a ref_ptr, not a raw pointer: the key then holds the
+            /// source alive, so its address cannot be freed and reused by a
+            /// different ShaderSet while this map still answers for it.
+            std::map<vsg::ref_ptr<vsg::ShaderSet>, vsg::ref_ptr<vsg::ShaderSet>> pointShaderSets;
             vsg::ref_ptr<vsg::SharedObjects> sharedObjects;
 
             vsg::CoordinateConvention source_coordinateConvention = vsg::CoordinateConvention::Y_UP;
