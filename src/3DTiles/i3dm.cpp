@@ -306,6 +306,23 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_i3dm(std::istream& fin, vsg::ref_ptr<con
     uint32_t size_of_feature_and_batch_tables = header.featureTableJSONByteLength + header.featureTableBinaryByteLength + header.batchTableJSONByteLength + header.batchTableBinaryLength;
     uint32_t size_of_gltfField = header.byteLength - sizeof(Header) - size_of_feature_and_batch_tables;
 
+    // Quantized positions are meaningless without their volume.
+    //
+    // The specification requires both globals whenever POSITION_QUANTIZED is
+    // used, and the defaults below -- offset 0, scale 1 -- are not a fallback,
+    // they are a different answer: the quantized range 0..65535 then decodes to
+    // 0..65535 METRES, scattering a city over 65 km. The pnts reader already
+    // refuses this case; i3dm decoded it silently, which is the failure mode
+    // this whole file has spent the most time on.
+    if (featureTable->POSITION_QUANTIZED &&
+        (featureTable->QUANTIZED_VOLUME_OFFSET.values.size() < 3 ||
+         featureTable->QUANTIZED_VOLUME_SCALE.values.size() < 3))
+    {
+        vsg::warn("Tiles3D::read_i3dm(", filename, ") POSITION_QUANTIZED without "
+                  "QUANTIZED_VOLUME_OFFSET/SCALE; cannot decode.");
+        return {};
+    }
+
     vsg::dvec3 quantizeOffset(0.0, 0, 0.0);
     vsg::dvec3 quantizeScale(1.0, 1.0, 1.0);
     if (featureTable->QUANTIZED_VOLUME_OFFSET && featureTable->QUANTIZED_VOLUME_OFFSET.values.size() == 3)
