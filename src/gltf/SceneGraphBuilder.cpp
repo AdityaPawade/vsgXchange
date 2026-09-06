@@ -1032,7 +1032,21 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
             {
                 if (auto vec4Rotations = array.cast<vsg::vec4Array>())
                 {
-                    auto quatArray = vsg::quatArray::create(array, 0, 12, vec4Rotations->size());
+                    // sizeof(vsg::quat), which is 16. The stride here was 12 --
+                    // a vec3's -- so every instance rotation after the first
+                    // read three floats from one quaternion and one from the
+                    // next, and the last read four bytes past the end of the
+                    // array. EXT_mesh_gpu_instancing's ROTATION is a VEC4
+                    // quaternion; there is no 12-byte spelling of it.
+                    //
+                    // Found by sweeping the corpus for attributes whose format
+                    // reads further than their stride advances, not by looking
+                    // at this line: SimpleInstancing draws 125 cubes and the
+                    // wrong ones are wrong by a rotation, which is not obvious
+                    // in a still.
+                    auto quatArray = vsg::quatArray::create(
+                        array, 0, static_cast<uint32_t>(sizeof(vsg::quat)),
+                        vec4Rotations->size());
                     array = quatArray;
                 }
             }
