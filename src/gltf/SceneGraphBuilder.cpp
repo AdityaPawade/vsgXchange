@@ -1014,10 +1014,16 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
                 }
             }
             else if (attribute_name == "POSITION" || attribute_name == "NORMAL" ||
-                     attribute_name == "TANGENT")
+                     attribute_name == "TANGENT" ||
+                     attribute_name == "COLOR_0" || attribute_name == "WEIGHTS_0")
             {
                 // KHR_mesh_quantization. TEXCOORD_n is handled above, before
                 // the texture transform, since that works in floats.
+                //
+                // COLOR_n and WEIGHTS_n are quantizable too and are consumed as
+                // floats; JOINTS_n is NOT -- it is an index and stays integer,
+                // which is why it has its own branch below rather than being
+                // swept in here.
                 const bool normalized =
                     array_itr->second.value < model->accessors.values.size() &&
                     model->accessors.values[array_itr->second.value]->normalized;

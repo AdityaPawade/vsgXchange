@@ -83,6 +83,25 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_cmpt(std::istream& fin, vsg::ref_ptr<con
         return {};
     }
 
+    // byteLength against the stream, before it becomes an allocation. A
+    // 16-byte header claiming 0xffffffff followed by EOF otherwise asks for
+    // four gigabytes and only discovers the truncation afterwards.
+    {
+        const std::streampos here = fin.tellg();
+        fin.seekg(0, std::ios::end);
+        const std::streampos endPos = fin.tellg();
+        fin.seekg(here);
+        if (endPos < here) return {};
+        const uint64_t remaining = static_cast<uint64_t>(endPos - here);
+
+        if (static_cast<uint64_t>(header.byteLength) > sizeof(Header) + remaining)
+        {
+            vsg::warn("cmpt byteLength ", header.byteLength, " but only ", remaining,
+                      " bytes follow the header.");
+            return {};
+        }
+    }
+
     const uint32_t sizeOfTiles = header.byteLength - static_cast<uint32_t>(sizeof(Header));
     std::string binary;
     binary.resize(sizeOfTiles);
@@ -105,8 +124,12 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_cmpt(std::istream& fin, vsg::ref_ptr<con
         // 100-byte payload read a kilobyte past its own allocation.
         if (pos > binary.size() || binary.size() - pos < sizeof(InnerHeader))
         {
+            // Refuse the whole composite, not just the tail. Returning the
+            // valid prefix is a WRONG PICTURE: an attacker can drop half a
+            // city and the viewer reports a successful load. Every other
+            // reader here refuses a malformed header outright.
             vsg::warn("cmpt inner tile ", i, " starts past the end of the payload.");
-            break;
+            return {};
         }
 
         InnerHeader tileHeader;
@@ -122,7 +145,7 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_cmpt(std::istream& fin, vsg::ref_ptr<con
         {
             vsg::warn("cmpt inner tile ", i, " declares ", tile->byteLength,
                       " bytes, of which ", binary.size() - pos, " remain.");
-            break;
+            return {};
         }
 
         vsg::mem_stream binary_fin(reinterpret_cast<uint8_t*>(&binary[pos]), tile->byteLength);

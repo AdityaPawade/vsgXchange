@@ -137,6 +137,23 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_b3dm(std::istream& fin, vsg::ref_ptr<con
                       header.byteLength, " is smaller than its own tables.");
             return {};
         }
+
+        // And byteLength itself against the stream.
+        //
+        // The check above proves the TABLES fit; it says nothing about the
+        // payload after them, which is sized as
+        // `byteLength - sizeof(Header) - sections`. All four tables zero and a
+        // byteLength near UINT32_MAX passes everything above and then asks
+        // resize() for four gigabytes, on a worker thread, from a file that is
+        // a few bytes long.
+        if (header.byteLength != 0 &&
+            static_cast<uint64_t>(header.byteLength) > sizeof(Header) + remaining)
+        {
+            vsg::warn("Tiles3D::read_b3dm(", filename, ") byteLength ",
+                      header.byteLength, " but only ", remaining,
+                      " bytes follow the header.");
+            return {};
+        }
     }
 
     // Feature table

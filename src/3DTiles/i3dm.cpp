@@ -236,6 +236,23 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_i3dm(std::istream& fin, vsg::ref_ptr<con
                       header.byteLength, " is smaller than its own tables.");
             return {};
         }
+
+        // And byteLength itself against the stream.
+        //
+        // The check above proves the TABLES fit; it says nothing about the
+        // payload after them, which is sized as
+        // `byteLength - sizeof(Header) - sections`. All four tables zero and a
+        // byteLength near UINT32_MAX passes everything above and then asks
+        // resize() for four gigabytes, on a worker thread, from a file that is
+        // a few bytes long.
+        if (header.byteLength != 0 &&
+            static_cast<uint64_t>(header.byteLength) > sizeof(Header) + remaining)
+        {
+            vsg::warn("Tiles3D::read_i3dm(", filename, ") byteLength ",
+                      header.byteLength, " but only ", remaining,
+                      " bytes follow the header.");
+            return {};
+        }
     }
 
     // Feature table
@@ -314,9 +331,14 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_i3dm(std::istream& fin, vsg::ref_ptr<con
     // 0..65535 METRES, scattering a city over 65 km. The pnts reader already
     // refuses this case; i3dm decoded it silently, which is the failure mode
     // this whole file has spent the most time on.
+    // EXACTLY three, not at least three. The assignments below accept only a
+    // size of 3, so a volume of four numbers passes a >= guard, fails the
+    // assignment, and decodes against the defaults -- quantized coordinates
+    // read as raw metres, which puts the instances kilometres away with no
+    // complaint anywhere.
     if (featureTable->POSITION_QUANTIZED &&
-        (featureTable->QUANTIZED_VOLUME_OFFSET.values.size() < 3 ||
-         featureTable->QUANTIZED_VOLUME_SCALE.values.size() < 3))
+        (featureTable->QUANTIZED_VOLUME_OFFSET.values.size() != 3 ||
+         featureTable->QUANTIZED_VOLUME_SCALE.values.size() != 3))
     {
         vsg::warn("Tiles3D::read_i3dm(", filename, ") POSITION_QUANTIZED without "
                   "QUANTIZED_VOLUME_OFFSET/SCALE; cannot decode.");
