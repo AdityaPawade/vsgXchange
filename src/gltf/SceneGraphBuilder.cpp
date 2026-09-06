@@ -25,6 +25,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <limits>
 
+#include <vsgXchange/3DTiles.h>
 #include <vsgXchange/gltf.h>
 
 #include <vsg/animation/AnimationGroup.h>
@@ -1465,6 +1466,41 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
         config->copyTo(stateGroup, sharedObjects);
 
         stateGroup->addChild(draw);
+
+        // Keep the per-vertex feature id.
+        //
+        // 3D Tiles marks which object each vertex belongs to with a custom
+        // attribute -- `_BATCHID` in 1.0, `_FEATURE_ID_0` in 1.1 -- and neither
+        // has a shader binding, so assignArray() drops both silently and a
+        // picked triangle has no way back to the building it is part of.
+        //
+        // It is attached to the STATE GROUP rather than to the draw because a
+        // ray intersection reports the path of nodes it passed through, and the
+        // state group is on that path. The array is parallel to POSITION, so
+        // the vertex index the intersection returns indexes it directly.
+        for (const char* semantic : {"_BATCHID", "_FEATURE_ID_0"})
+        {
+            auto itr = primitive->attributes.values.find(semantic);
+            if (itr == primitive->attributes.values.end()) continue;
+            if (!itr->second.valid() || itr->second.value >= vsg_accessors.size()) continue;
+
+            auto ids = vsg_accessors[itr->second.value];
+            if (!ids) continue;
+
+            // Shorter than the vertices it labels means an index from a picked
+            // triangle could fall outside it. The whole point of this array is
+            // to be indexed by something that came from elsewhere.
+            if (ids->valueCount() < vertexCount)
+            {
+                vsg::warn("gltf: ", semantic, " has ", ids->valueCount(),
+                          " values for ", vertexCount, " vertices; it is dropped, so "
+                          "this primitive's features cannot be identified.");
+                continue;
+            }
+
+            stateGroup->setObject(Tiles3D::FEATURE_IDS_KEY, ids);
+            break;      // 1.0 and 1.1 do not appear together; the first wins
+        }
 
         if (vsg_material->blending)
         {

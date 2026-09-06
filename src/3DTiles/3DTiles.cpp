@@ -10,6 +10,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 </editor-fold> */
 
+#include <iomanip>
+#include <sstream>
 #include <vsgXchange/3DTiles.h>
 
 #include <vsg/io/Path.h>
@@ -378,6 +380,80 @@ void Tiles3D::Batch::read_number(vsg::JSONParser& parser, const std::string_view
         input >> byteOffset;
     else
         parser.warning();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// FeatureTable
+//
+namespace
+{
+    //! One element of a vsg::Data array, as text.
+    //!
+    //! A batch table's arrays come back as whatever type the JSON held -- a
+    //! stringArray of names, a doubleArray of heights, an intArray of ids --
+    //! and the caller wants to show the value, not to switch on its type. A
+    //! visitor keeps that switch in one place instead of at every call site.
+    struct ElementAsString : public vsg::ConstVisitor
+    {
+        uint32_t index = 0;
+        std::string result;
+
+        explicit ElementAsString(uint32_t in_index) : index(in_index) {}
+
+        //! Trailing zeros removed, so a height of 12 does not read "12.000000".
+        static std::string number(double v)
+        {
+            std::ostringstream s;
+            s << std::setprecision(10) << v;
+            return s.str();
+        }
+
+        template<typename A>
+        bool take(const vsg::Data& data)
+        {
+            const auto* a = dynamic_cast<const A*>(&data);
+            if (!a || index >= a->size()) return false;
+            result = number(static_cast<double>(a->at(index)));
+            return true;
+        }
+
+        void apply(const vsg::Data& data) override
+        {
+            if (auto strings = dynamic_cast<const vsg::stringArray*>(&data))
+            {
+                if (index < strings->size()) result = strings->at(index);
+                return;
+            }
+            if (take<vsg::doubleArray>(data)) return;
+            if (take<vsg::floatArray>(data)) return;
+            if (take<vsg::intArray>(data)) return;
+            if (take<vsg::uintArray>(data)) return;
+            if (take<vsg::shortArray>(data)) return;
+            if (take<vsg::ushortArray>(data)) return;
+            if (take<vsg::byteArray>(data)) return;
+            if (take<vsg::ubyteArray>(data)) return;
+
+            // Anything else -- a vec3Array of positions, say -- is left empty
+            // rather than guessed at. An empty string is a caller's cue that
+            // this property is not one it can show, which is better than a
+            // plausible-looking number that means something else.
+        }
+    };
+}
+
+std::string Tiles3D::FeatureTable::valueAsString(const std::string& name, uint32_t index) const
+{
+    // Both of these come from outside: `index` from a picked triangle, `name`
+    // from an HTTP request. Neither is trusted.
+    if (index >= count) return {};
+
+    auto itr = properties.find(name);
+    if (itr == properties.end() || !itr->second) return {};
+
+    ElementAsString visitor(index);
+    itr->second->accept(visitor);
+    return visitor.result;
 }
 
 void Tiles3D::Batch::convert(BatchTable& batchTable)

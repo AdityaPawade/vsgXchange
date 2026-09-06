@@ -372,6 +372,38 @@ namespace vsgXchange
             void read_number(vsg::JSONParser& parser, const std::string_view& property, std::istream& input) override;
         };
 
+        /// Per-feature properties for one tile, in one shape whatever wrote them.
+        ///
+        /// 3D Tiles carries this two different ways and the application should
+        /// not have to know which it got. A 1.0 tile has a BATCH TABLE -- JSON
+        /// arrays, one entry per feature, beside a `_BATCHID` vertex attribute.
+        /// A 1.1 tile has EXT_structural_metadata property tables selected by
+        /// `_FEATURE_ID_n`. Both mean the same thing: this tile draws N objects,
+        /// and each has these named values.
+        ///
+        /// Attached to the tile's node under FEATURE_TABLE_KEY, beside the
+        /// per-vertex ids under FEATURE_IDS_KEY. Together those two answer
+        /// "what did the operator just click on".
+        class VSGXCHANGE_DECLSPEC FeatureTable : public vsg::Inherit<vsg::Object, FeatureTable>
+        {
+        public:
+            /// How many features this tile draws. Every array in `properties`
+            /// has this many entries.
+            uint32_t count = 0;
+
+            /// Property name to its values, one per feature, in feature order.
+            /// The concrete type is whatever the document used -- a stringArray
+            /// for names, a doubleArray for heights -- so a caller reads it with
+            /// the usual vsg::Data visitors rather than a variant of our own.
+            std::map<std::string, vsg::ref_ptr<vsg::Data>> properties;
+
+            /// The value of `name` for feature `index`, formatted for display,
+            /// or an empty string if there is no such property or the index is
+            /// outside the table. Never throws: the index comes from a picked
+            /// triangle and the name from an HTTP request.
+            std::string valueAsString(const std::string& name, uint32_t index) const;
+        };
+
         struct VSGXCHANGE_DECLSPEC BatchTable : public vsg::Inherit<gltf::ExtensionsExtras, BatchTable>
         {
             std::map<std::string, vsg::ref_ptr<Batch>> batches;
@@ -386,6 +418,14 @@ namespace vsgXchange
 
             void report(vsg::LogOutput& output);
         };
+
+        /// Where a tile's per-feature metadata is attached on its node.
+        ///
+        /// Named constants because three libraries read them -- the reader
+        /// writes, the SDK's pick reads, and the tests assert -- and a typo in
+        /// any one of them is a silent "this tile has no metadata".
+        static constexpr const char* FEATURE_TABLE_KEY = "tiles3d.featureTable";
+        static constexpr const char* FEATURE_IDS_KEY = "tiles3d.featureIds";
 
         // https://github.com/CesiumGS/3d-tiles/blob/main/specification/TileFormats/Instanced3DModel/README.adoc
         struct VSGXCHANGE_DECLSPEC i3dm_FeatureTable : public vsg::Inherit<gltf::ExtensionsExtras, i3dm_FeatureTable>

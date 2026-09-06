@@ -255,5 +255,44 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_b3dm(std::istream& fin, vsg::ref_ptr<con
 
     if (model && filename) model->setValue("b3dm", filename);
 
+    // Carry the batch table onto the node instead of dropping it.
+    //
+    // It has always been PARSED -- Batch::convert() turns each property into a
+    // typed array -- and then used only for report(), which is why a tileset
+    // full of buildings could be drawn but never interrogated. The old TODO
+    // above asked for the glTF loader to understand batched accessors; it does
+    // not need to. The ids ride on the mesh as _BATCHID, and the properties
+    // ride here, and the two are joined at pick time.
+    if (model && batchTable && !batchTable->batches.empty())
+    {
+        auto features = FeatureTable::create();
+        features->count = batchTable->length;
+
+        for (auto& [name, batch] : batchTable->batches)
+        {
+            if (!batch || !batch->object) continue;
+            if (auto data = batch->object.cast<vsg::Data>())
+            {
+                // A property array shorter than the feature count would be read
+                // past its end by anything indexing it by feature. The document
+                // says how many features there are; a property that disagrees is
+                // dropped rather than trusted for the part that fits.
+                if (data->valueCount() < features->count)
+                {
+                    vsg::warn("Tiles3D::read_b3dm(", filename, ") batch table property \"",
+                              name, "\" has ", data->valueCount(), " values for ",
+                              features->count, " features; it is dropped.");
+                    continue;
+                }
+                features->properties[name] = data;
+            }
+        }
+
+        if (!features->properties.empty())
+        {
+            model->setObject(FEATURE_TABLE_KEY, features);
+        }
+    }
+
     return model;
 }
