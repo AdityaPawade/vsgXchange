@@ -10,6 +10,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 </editor-fold> */
 
+#include <set>
+
 #include <vsgXchange/gltf.h>
 
 #ifdef vsgXchange_meshoptimizer
@@ -837,10 +839,30 @@ size_t gltf::glTF::decodeMeshopt()
     constexpr size_t MAX_FALLBACK_TOTAL = 512u * 1024u * 1024u;
     size_t fallbackAllocated = 0;
 
+    // Which buffers this pass created. The spec says a compressed view decodes
+    // into a FALLBACK buffer -- one with no uri, marked
+    // EXT_meshopt_compression.fallback -- and by the time this runs every real
+    // buffer already holds its bytes, from a uri or from the GLB's BIN chunk.
+    //
+    // So a target that already has data is either a fallback this pass
+    // allocated (several views legitimately share one) or a real buffer the
+    // document is pointing us at to overwrite. Without this set the second case
+    // decodes straight over the model's own geometry: in range, bounds-checked,
+    // and completely wrong.
+    std::set<const Buffer*> allocatedHere;
+
     auto fallbackStorage = [&](glTFid id) -> vsg::ref_ptr<vsg::ubyteArray> {
         if (!id.valid() || id.value >= buffers.values.size()) return {};
         auto& buffer = buffers.values[id.value];
         if (!buffer || buffer->byteLength == 0) return {};
+
+        if (buffer->data && allocatedHere.count(buffer.get()) == 0)
+        {
+            vsg::warn("EXT_meshopt_compression: buffer ", id.value,
+                      " already holds data, so it is not a fallback buffer; "
+                      "decoding into it would overwrite the model's own bytes.");
+            return {};
+        }
 
         if (!buffer->data)
         {
@@ -868,6 +890,7 @@ size_t gltf::glTF::decodeMeshopt()
             std::memset(storage->dataPointer(), 0, buffer->byteLength);
             buffer->data = storage;
             fallbackAllocated += buffer->byteLength;
+            allocatedHere.insert(buffer.get());
         }
         return buffer->data.cast<vsg::ubyteArray>();
     };
@@ -971,11 +994,54 @@ size_t gltf::glTF::decodeMeshopt()
             continue;
         }
 
-        const size_t produced = static_cast<size_t>(meshopt->count) * meshopt->byteStride;
-        if (produced > view->byteLength)
+        // A filter is only meaningful for ATTRIBUTES. The extension's validity
+        // rules require NONE, or nothing, for TRIANGLES and INDICES -- and with
+        // good reason: a filter applied over a successfully decoded INDEX
+        // buffer reinterprets those indices as octahedral vectors or
+        // quaternions and hands back arbitrary triangle connectivity, having
+        // reported success. A wrong picture, silently.
+        if (!meshopt->filter.empty() && meshopt->filter != "NONE" &&
+            meshopt->mode != "ATTRIBUTES")
         {
-            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex, " would produce ",
-                      produced, " bytes into a view of ", view->byteLength, ".");
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex, " uses filter \"",
+                      meshopt->filter, "\" with mode \"", meshopt->mode,
+                      "\"; a filter is only valid for ATTRIBUTES.");
+            continue;
+        }
+
+        // The view and the extension must agree on the stride, because they are
+        // read by different things: the decode writes elements of the
+        // EXTENSION's stride, and every accessor afterwards walks the buffer at
+        // the VIEW's. Let them differ and the vertices decode correctly and are
+        // then read at the wrong spacing -- scrambled geometry, reported as a
+        // success.
+        //
+        // byteStride is 1 when the document did not declare one: glTF's own
+        // schema puts a declared stride at 4..252 and a multiple of 4, so 1 is
+        // never a real value and means absent. An index view legitimately has
+        // none.
+        if (view->byteStride > 1 && view->byteStride != meshopt->byteStride)
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex,
+                      " decodes at stride ", meshopt->byteStride,
+                      " into a view whose stride is ", view->byteStride,
+                      "; the two must agree.");
+            continue;
+        }
+
+        const size_t produced = static_cast<size_t>(meshopt->count) * meshopt->byteStride;
+
+        // Exactly, not at most. The extension requires the view's byteLength to
+        // BE count * byteStride. Accepting a longer view leaves a tail of zeros
+        // inside a range the document says holds decompressed data, and
+        // accepting a shorter one is the overflow this check was first written
+        // for.
+        if (produced != view->byteLength)
+        {
+            vsg::warn("EXT_meshopt_compression on bufferView ", viewIndex, " produces ",
+                      produced, " bytes (count ", meshopt->count, " x stride ",
+                      meshopt->byteStride, ") into a view of ", view->byteLength,
+                      "; the extension requires them to be equal.");
             continue;
         }
 
