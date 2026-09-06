@@ -229,11 +229,17 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_i3dm(std::istream& fin, vsg::ref_ptr<con
             return {};
         }
 
-        if (header.byteLength != 0 &&
-            static_cast<uint64_t>(header.byteLength) < sizeof(Header) + sections)
+        // No exemption for zero. byteLength is subtracted from below --
+        //     size_of_gltfField = byteLength - sizeof(Header) - sections
+        // -- so treating 0 as "not stated" and carrying on is the one value
+        // that makes that subtraction underflow to about four gigabytes, which
+        // then goes to resize() from a file a few bytes long. The
+        // specification requires the field; a file that leaves it out is
+        // malformed and is refused here rather than trusted and subtracted.
+        if (static_cast<uint64_t>(header.byteLength) < sizeof(Header) + sections)
         {
             vsg::warn("Tiles3D::read_i3dm(", filename, ") byteLength ",
-                      header.byteLength, " is smaller than its own tables.");
+                      header.byteLength, " is smaller than its own header and tables.");
             return {};
         }
 
@@ -245,8 +251,7 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_i3dm(std::istream& fin, vsg::ref_ptr<con
         // byteLength near UINT32_MAX passes everything above and then asks
         // resize() for four gigabytes, on a worker thread, from a file that is
         // a few bytes long.
-        if (header.byteLength != 0 &&
-            static_cast<uint64_t>(header.byteLength) > sizeof(Header) + remaining)
+        if (static_cast<uint64_t>(header.byteLength) > sizeof(Header) + remaining)
         {
             vsg::warn("Tiles3D::read_i3dm(", filename, ") byteLength ",
                       header.byteLength, " but only ", remaining,
