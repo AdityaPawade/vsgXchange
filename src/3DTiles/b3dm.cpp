@@ -20,6 +20,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include <vsg/threading/OperationThreads.h>
 #include <vsg/utils/CommandLine.h>
 
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stack>
@@ -71,6 +72,163 @@ void Tiles3D::b3dm_FeatureTable::report(vsg::LogOutput& output)
 //
 // read_b3dm
 //
+namespace
+{
+    //! The batch table as a FeatureTable, with the fan-out capped.
+    //!
+    //! Every accepted array is RETAINED for the life of the tile, formatted on
+    //! every click, serialised into every pick response and turned into a DOM
+    //! row by the viewer. A tileset declaring two thousand properties costs all
+    //! four of those, repeatedly, for one operator click -- and all of it comes
+    //! from a document fetched over HTTP.
+    //!
+    //! 128 is far past anything real: the corpus city tiles publish four, and a
+    //! rich cadastral dataset a few dozen. A name longer than 256 characters is
+    //! not a name.
+    vsg::ref_ptr<Tiles3D::FeatureTable> makeFeatureTable(Tiles3D::BatchTable& batchTable,
+                                                         const vsg::Path& filename)
+    {
+        constexpr size_t MAX_PROPERTIES = 128;
+        constexpr size_t MAX_NAME_LENGTH = 256;
+
+        auto features = Tiles3D::FeatureTable::create();
+        features->count = batchTable.length;
+
+        for (auto& [name, batch] : batchTable.batches)
+        {
+            if (features->properties.size() >= MAX_PROPERTIES)
+            {
+                vsg::warn("Tiles3D (", filename, ") declares more than ", MAX_PROPERTIES,
+                          " batch-table properties; the rest are dropped.");
+                break;
+            }
+            if (name.size() > MAX_NAME_LENGTH)
+            {
+                vsg::warn("Tiles3D (", filename, ") has a batch-table property name of ",
+                          name.size(), " characters; it is dropped.");
+                continue;
+            }
+            if (!batch || !batch->object) continue;
+            if (auto data = batch->object.cast<vsg::Data>())
+            {
+                // A property array shorter than the feature count would be read
+                // past its end by anything indexing it by feature. The document
+                // says how many features there are; a property that disagrees is
+                // dropped rather than trusted for the part that fits.
+                if (data->valueCount() < features->count)
+                {
+                    vsg::warn("Tiles3D (", filename, ") batch table property \"", name,
+                              "\" has ", data->valueCount(), " values for ",
+                              features->count, " features; it is dropped.");
+                    continue;
+                }
+                features->properties[name] = data;
+            }
+        }
+
+        return features->properties.empty() ? vsg::ref_ptr<Tiles3D::FeatureTable>{} : features;
+    }
+}
+
+size_t Tiles3D::attachFeatureTable(vsg::Node& model, vsg::ref_ptr<FeatureTable> table)
+{
+    if (!table) return 0;
+
+    struct PairWithIds : public vsg::Visitor
+    {
+        vsg::ref_ptr<FeatureTable> table;
+        size_t paired = 0;
+
+        void apply(vsg::Object& object) override
+        {
+            if (object.getObject(FEATURE_IDS_KEY))
+            {
+                object.setObject(FEATURE_TABLE_KEY, table);
+                ++paired;
+            }
+            object.traverse(*this);
+        }
+    } pairer;
+
+    // On the tile root, so "what does this tile contain" can be asked of the
+    // tile -- and on every node carrying the per-vertex ids, so a consumer finds
+    // the two together rather than assembling them from different places.
+    model.setObject(FEATURE_TABLE_KEY, table);
+
+    pairer.table = table;
+    model.accept(pairer);
+
+    return pairer.paired;
+}
+
+vsg::ref_ptr<Tiles3D::FeatureTable> Tiles3D::readFeatureTable(const uint8_t* b3dm, size_t size)
+{
+    // magic, version, byteLength, then four table lengths.
+    constexpr size_t HEADER = 28;
+
+    if (!b3dm || size < HEADER) return {};
+    if (std::memcmp(b3dm, "b3dm", 4) != 0) return {};
+
+    auto u32 = [&](size_t offset) {
+        uint32_t v = 0;
+        std::memcpy(&v, b3dm + offset, sizeof(v));
+        return v;
+    };
+
+    // 64-bit throughout: four uint32 lengths can sum past 2^32, and the bounds
+    // check below is the only thing between a hostile header and a read off the
+    // end of the payload.
+    const uint64_t featureTableJSON = u32(12);
+    const uint64_t featureTableBinary = u32(16);
+    const uint64_t batchTableJSON = u32(20);
+    const uint64_t batchTableBinary = u32(24);
+
+    const uint64_t batchStart = uint64_t(HEADER) + featureTableJSON + featureTableBinary;
+    const uint64_t batchEnd = batchStart + batchTableJSON + batchTableBinary;
+
+    // A header describing more than the payload holds is refused rather than
+    // believed. Nothing below allocates on a length that has not passed this.
+    if (batchEnd > size) return {};
+    if (batchTableJSON == 0) return {};   // no batch table: ordinary, not an error
+
+    // BATCH_LENGTH lives in the feature table and says how many features the
+    // property arrays are supposed to describe. Without it a property array has
+    // no length to be checked against.
+    uint32_t batchLength = 0;
+    if (featureTableJSON > 0)
+    {
+        vsg::JSONParser ftParser;
+        ftParser.buffer.assign(reinterpret_cast<const char*>(b3dm) + HEADER,
+                               reinterpret_cast<const char*>(b3dm) + HEADER + featureTableJSON);
+
+        auto ft = b3dm_FeatureTable::create();
+        ftParser.read_object(*ft);
+        batchLength = ft->BATCH_LENGTH;
+    }
+
+    auto batchTable = BatchTable::create();
+
+    if (batchTableBinary > 0)
+    {
+        batchTable->binary = vsg::ubyteArray::create(static_cast<uint32_t>(batchTableBinary));
+        std::memcpy(batchTable->binary->dataPointer(),
+                    b3dm + batchStart + batchTableJSON,
+                    static_cast<size_t>(batchTableBinary));
+    }
+
+    vsg::JSONParser parser;
+    parser.buffer.assign(reinterpret_cast<const char*>(b3dm) + batchStart,
+                         reinterpret_cast<const char*>(b3dm) + batchStart + batchTableJSON);
+    parser.read_object(*batchTable);
+
+    batchTable->length = batchLength;
+    batchTable->convert();
+
+    if (batchTable->batches.empty()) return {};
+
+    return makeFeatureTable(*batchTable, "b3dm");
+}
+
 vsg::ref_ptr<vsg::Object> Tiles3D::read_b3dm(std::istream& fin, vsg::ref_ptr<const vsg::Options> options, const vsg::Path& filename) const
 {
 
@@ -265,32 +423,24 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_b3dm(std::istream& fin, vsg::ref_ptr<con
     // ride here, and the two are joined at pick time.
     if (model && batchTable && !batchTable->batches.empty())
     {
-        auto features = FeatureTable::create();
-        features->count = batchTable->length;
-
-        for (auto& [name, batch] : batchTable->batches)
+        // Carry the batch table onto the node instead of dropping it.
+        //
+        // It has always been PARSED -- Batch::convert() turns each property
+        // into a typed array -- and then used only for report(), which is why a
+        // tileset full of buildings could be drawn but never interrogated. The
+        // ids ride on the mesh as _BATCHID, the properties ride here, and the
+        // two are joined at pick time.
+        if (auto features = makeFeatureTable(*batchTable, filename))
         {
-            if (!batch || !batch->object) continue;
-            if (auto data = batch->object.cast<vsg::Data>())
+            if (Tiles3D::attachFeatureTable(*model, features) == 0)
             {
-                // A property array shorter than the feature count would be read
-                // past its end by anything indexing it by feature. The document
-                // says how many features there are; a property that disagrees is
-                // dropped rather than trusted for the part that fits.
-                if (data->valueCount() < features->count)
-                {
-                    vsg::warn("Tiles3D::read_b3dm(", filename, ") batch table property \"",
-                              name, "\" has ", data->valueCount(), " values for ",
-                              features->count, " features; it is dropped.");
-                    continue;
-                }
-                features->properties[name] = data;
+                // The properties survived and the ids did not, so nothing can
+                // say which feature a vertex belongs to. The table stays on the
+                // tile for anyone asking about the tile as a whole, but no
+                // click will ever resolve against it.
+                vsg::warn("Tiles3D::read_b3dm(", filename, ") has a batch table but no "
+                          "_BATCHID on any primitive; its features cannot be picked.");
             }
-        }
-
-        if (!features->properties.empty())
-        {
-            model->setObject(FEATURE_TABLE_KEY, features);
         }
     }
 

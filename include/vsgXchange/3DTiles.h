@@ -427,6 +427,37 @@ namespace vsgXchange
         static constexpr const char* FEATURE_TABLE_KEY = "tiles3d.featureTable";
         static constexpr const char* FEATURE_IDS_KEY = "tiles3d.featureIds";
 
+        /// The batch table of a b3dm payload, without reading its geometry.
+        ///
+        /// For a host that unpacks the b3dm wrapper itself and hands only the
+        /// embedded glb to a reader -- which rocky does deliberately, to keep
+        /// the header arithmetic in bounds -- the batch table would otherwise
+        /// be discarded with the wrapper, and the tile would draw with no way
+        /// to ask what is in it.
+        ///
+        /// Bounded: a header describing more than \p size holds is refused
+        /// rather than believed, so nothing here allocates on a number an
+        /// untrusted server chose.
+        ///
+        /// eturn The table, or null when the payload is not a b3dm, is
+        ///         inconsistent, or simply carries no batch table -- all three
+        ///         are ordinary and none is an error.
+        static vsg::ref_ptr<FeatureTable> readFeatureTable(const uint8_t* b3dm, size_t size);
+
+        /// Put \p table on \p model's root and on every node carrying
+        /// FEATURE_IDS_KEY.
+        ///
+        /// Both places, because a consumer searching for the two separately
+        /// pairs whatever it finds first -- which can be a nested child tile's
+        /// ids with an ancestor's table, showing the wrong feature's data
+        /// confidently and with no warning. Having them on one node makes that
+        /// impossible rather than merely unlikely.
+        ///
+        /// eturn How many id-carrying nodes were paired. Zero means the
+        ///         payload has a batch table but no _BATCHID, so its features
+        ///         cannot be picked.
+        static size_t attachFeatureTable(vsg::Node& model, vsg::ref_ptr<FeatureTable> table);
+
         // https://github.com/CesiumGS/3d-tiles/blob/main/specification/TileFormats/Instanced3DModel/README.adoc
         struct VSGXCHANGE_DECLSPEC i3dm_FeatureTable : public vsg::Inherit<gltf::ExtensionsExtras, i3dm_FeatureTable>
         {
