@@ -23,6 +23,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <set>
 
+#include <limits>
+
 #include <vsgXchange/gltf.h>
 
 #include <vsg/animation/AnimationGroup.h>
@@ -1008,6 +1010,10 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
 
         vsg::DataList vertexArrays;
 
+        // The shortest VERTEX-rate array seen, so the draw below cannot ask
+        // for more vertices than the narrowest attribute actually has.
+        uint32_t smallestVertexArray = std::numeric_limits<uint32_t>::max();
+
         auto assignArray = [&](Attributes& attrib, VkVertexInputRate vertexInputRate, const std::string& attribute_name) -> bool {
             auto array_itr = attrib.values.find(attribute_name);
             if (array_itr == attrib.values.end()) return false;
@@ -1133,6 +1139,22 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
             }
 
             setVertexFormatFromType(array);
+
+            // The shortest VERTEX-rate array is what may safely be drawn.
+            //
+            // glTF requires every attribute accessor of a primitive to have the
+            // same count, and the draw below takes its vertex count from the
+            // FIRST array. A document that disagrees with itself -- POSITION
+            // count 1000, NORMAL count 3 -- therefore had the pipeline read a
+            // thousand normals out of a three-element array, which is a GPU
+            // read far past the end of the buffer. The counts come from the
+            // document, so this is the ordinary hostile case.
+            if (vertexInputRate == VK_VERTEX_INPUT_RATE_VERTEX && array)
+            {
+                const uint32_t n = array->valueCount();
+                if (n < smallestVertexArray) smallestVertexArray = n;
+            }
+
             config->assignArray(vertexArrays, name_itr->second, vertexInputRate, array);
             return true;
         };
@@ -1160,6 +1182,21 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
         assignArray(primitive->attributes, VK_VERTEX_INPUT_RATE_VERTEX, "TEXCOORD_3");
 
         uint32_t vertexCount = vertexArrays.front()->valueCount();
+
+        // Clamp rather than refuse. A count mismatch makes the document invalid
+        // by the specification, but drawing the part that IS consistent is more
+        // use than drawing nothing, and it is what the reader does everywhere
+        // else it meets a document that disagrees with itself. What it must not
+        // do is draw the part that is not there.
+        if (smallestVertexArray != std::numeric_limits<uint32_t>::max() &&
+            smallestVertexArray < vertexCount)
+        {
+            vsg::warn("gltf: a primitive's attribute accessors disagree on count -- "
+                      "the first has ", vertexCount, " and the shortest has ",
+                      smallestVertexArray, ". glTF requires them to be equal; drawing ",
+                      smallestVertexArray, " vertices rather than reading past the shortest.");
+            vertexCount = smallestVertexArray;
+        }
         uint32_t instanceCount = 1;
         if (meshExtras.instancedAttributes)
         {
