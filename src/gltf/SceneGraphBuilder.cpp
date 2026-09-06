@@ -917,7 +917,19 @@ vsg::ref_ptr<vsg::Node> gltf::SceneGraphBuilder::createMesh(vsg::ref_ptr<gltf::M
             vsg_material = default_material;
         }
 
-        auto config = vsg::GraphicsPipelineConfigurator::create(vsg_material->shaderSet);
+        // A point cloud needs a vertex shader that writes gl_PointSize, and
+        // that is the only thing the point shader set changes. Chosen by the
+        // primitive's TOPOLOGY rather than by its material, so it covers both
+        // routes: a .pnts, whose generated glTF is unlit, and a glTF that
+        // simply declares mode 0 with an ordinary material.
+        auto shaderSetForPrimitive = vsg_material->shaderSet;
+        if (primitive->mode < (sizeof(topologyLookup) / sizeof(topologyLookup[0])) &&
+            topologyLookup[primitive->mode] == VK_PRIMITIVE_TOPOLOGY_POINT_LIST)
+        {
+            if (auto points = getOrCreatePointShaderSet()) shaderSetForPrimitive = points;
+        }
+
+        auto config = vsg::GraphicsPipelineConfigurator::create(shaderSetForPrimitive);
         config->descriptorConfigurator = vsg_material;
         if (options) config->assignInheritedState(options->inheritedState);
 
@@ -2124,6 +2136,109 @@ vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreatePbrShaderSet()
     if (sharedObjects) sharedObjects->share(pbrShaderSet);
 
     return pbrShaderSet;
+}
+
+vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreatePointShaderSet()
+{
+    if (pointShaderSet) return pointShaderSet;
+
+    auto flat = vsg::createFlatShadedShaderSet(options);
+    if (!flat)
+    {
+        return {};
+    }
+
+    // Clone before patching. The flat set is shared -- vsg::SharedObjects hands
+    // the same instance to every unlit material in the scene -- so editing it
+    // in place would give every unlit TRIANGLE a point size too, and change
+    // meshes that have nothing to do with this.
+    auto patched = vsg::ShaderSet::create();
+    patched->stages = flat->stages;
+    patched->attributeBindings = flat->attributeBindings;
+    patched->descriptorBindings = flat->descriptorBindings;
+    patched->pushConstantRanges = flat->pushConstantRanges;
+    patched->definesArrayStates = flat->definesArrayStates;
+    patched->optionalDefines = flat->optionalDefines;
+    patched->defaultGraphicsPipelineStates = flat->defaultGraphicsPipelineStates;
+    patched->customDescriptorSetBindings = flat->customDescriptorSetBindings;
+
+    // `variants` is deliberately NOT copied: it caches compiled stages against
+    // the compile settings that produced them, and those were compiled from the
+    // shader this one is a patch of.
+
+    bool patchedAStage = false;
+
+    for (auto& stage : patched->stages)
+    {
+        if (!stage || stage->stage != VK_SHADER_STAGE_VERTEX_BIT) continue;
+        if (!stage->module || stage->module->source.empty()) continue;
+
+        std::string source = stage->module->source;
+
+        // Two edits, and both have to land or neither is any use: the
+        // declaration in the out block and the assignment in main(). Both sit
+        // behind #ifdef VSG_POINT_SPRITE, so rather than arrange for that
+        // define to be set on every point material, the guards are removed --
+        // this shader set is only ever used for POINT_LIST.
+        const std::string declGuardOpen = "#ifdef VSG_POINT_SPRITE\n    float gl_PointSize;\n#endif";
+        const std::string declPlain = "    float gl_PointSize;";
+
+        const std::string assignGuarded =
+            "#ifdef VSG_POINT_SPRITE\n    gl_PointSize = 1.0;\n#endif";
+
+        // Size in pixels, not in metres.
+        //
+        // A world-sized point needs the viewport height to convert to pixels,
+        // and this shader's push constants carry only the projection and
+        // modelview -- so a "0.35 m" point would be fake precision computed
+        // from an assumed 1080-pixel window. A fixed pixel size makes no claim
+        // it cannot keep, is what most point-cloud viewers default to, and is
+        // the difference between a cloud you can see and one you cannot.
+        // Making it configurable, and world-sized, is VGIS-481's remainder.
+        const std::string assignPlain = "    gl_PointSize = 4.0;";
+
+        const bool hadDecl = source.find(declGuardOpen) != std::string::npos;
+        const bool hadAssign = source.find(assignGuarded) != std::string::npos;
+
+        if (!hadDecl || !hadAssign)
+        {
+            // The shader changed shape underneath us. Say so and use the flat
+            // set unpatched: one-pixel points are a poor picture, a shader that
+            // fails to compile is no picture at all.
+            vsg::warn("gltf: could not find gl_PointSize in the flat vertex shader "
+                      "(declaration ", hadDecl, ", assignment ", hadAssign,
+                      "); point clouds will draw at one pixel per point.");
+            continue;
+        }
+
+        source.replace(source.find(declGuardOpen), declGuardOpen.size(), declPlain);
+        source.replace(source.find(assignGuarded), assignGuarded.size(), assignPlain);
+
+        // A new module, with the SPIR-V dropped.
+        //
+        // A ShaderModule carries both the GLSL and its precompiled SPIR-V, and
+        // the compiled code wins. Editing the source and keeping the code
+        // produces a shader set that looks patched and behaves exactly as
+        // before -- which is the kind of change that reads as "the fix did not
+        // work" for an afternoon.
+        auto module = vsg::ShaderModule::create(source);
+        auto replacement = vsg::ShaderStage::create(stage->stage, stage->entryPointName, module);
+        replacement->specializationConstants = stage->specializationConstants;
+        stage = replacement;
+        patchedAStage = true;
+    }
+
+    if (!patchedAStage)
+    {
+        // Nothing to gain and something to lose: hand back the original.
+        pointShaderSet = flat;
+        return pointShaderSet;
+    }
+
+    if (sharedObjects) sharedObjects->share(patched);
+
+    pointShaderSet = patched;
+    return pointShaderSet;
 }
 
 vsg::ref_ptr<vsg::ShaderSet> gltf::SceneGraphBuilder::getOrCreateFlatShaderSet()

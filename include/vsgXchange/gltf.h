@@ -690,6 +690,7 @@ namespace vsgXchange
             vsg::ref_ptr<const vsg::Options> options;
             vsg::ref_ptr<vsg::ShaderSet> flatShaderSet;
             vsg::ref_ptr<vsg::ShaderSet> pbrShaderSet;
+            vsg::ref_ptr<vsg::ShaderSet> pointShaderSet;
             vsg::ref_ptr<vsg::SharedObjects> sharedObjects;
 
             vsg::CoordinateConvention source_coordinateConvention = vsg::CoordinateConvention::Y_UP;
@@ -795,6 +796,19 @@ namespace vsgXchange
 
             vsg::ref_ptr<vsg::ShaderSet> getOrCreatePbrShaderSet();
             vsg::ref_ptr<vsg::ShaderSet> getOrCreateFlatShaderSet();
+
+            /// The flat shader set, with a usable gl_PointSize.
+            ///
+            /// Vulkan takes a point's size from gl_PointSize in the vertex
+            /// shader and nowhere else. VSG's flat shader already has the
+            /// plumbing -- VSG_POINT_SPRITE is in its import_defines, the
+            /// out gl_PerVertex block declares gl_PointSize behind that define,
+            /// and main() assigns it -- but it assigns the constant 1.0, so
+            /// every point in every cloud is a single pixel whatever the
+            /// distance. A 29,338-point cloud covered 0.69% of the viewport
+            /// where a mesh of the same extent covered 8%, which reads as a
+            /// failed load rather than as data.
+            vsg::ref_ptr<vsg::ShaderSet> getOrCreatePointShaderSet();
 
             vsg::ref_ptr<vsg::Object> createSceneGraph(vsg::ref_ptr<gltf::glTF> in_model, vsg::ref_ptr<const vsg::Options> in_options);
         };
