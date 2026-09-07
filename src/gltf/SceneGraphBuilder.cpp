@@ -295,6 +295,15 @@ namespace
     {
         if (!image) return;
 
+        // An escape hatch, because this changes how every glTF in the app
+        // looks and "it went darker/brighter" is the kind of claim that should
+        // be settled by flipping a switch rather than by two rebuilds.
+        static const bool disabled = []{
+            const char* v = std::getenv("VSGX_NO_GLTF_UNORM");
+            return v && *v && *v != '0';
+        }();
+        if (disabled) return;
+
         switch (image->properties.format)
         {
         case VK_FORMAT_R8G8B8A8_SRGB: image->properties.format = VK_FORMAT_R8G8B8A8_UNORM; break;
