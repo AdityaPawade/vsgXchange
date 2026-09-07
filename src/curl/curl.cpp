@@ -45,18 +45,72 @@ namespace vsgXchange
     ///
     /// This is Windows-only by nature: on Linux operator/ inserts '/' and the
     /// same code path works, which is why it went unnoticed.
+    /// The origin of a URL: scheme plus authority, with no trailing slash.
+    /// Empty when the string does not look like one.
+    std::string originOf(const std::string& url)
+    {
+        auto scheme = url.find("://");
+        if (scheme == std::string::npos)
+            return {};
+
+        auto slash = url.find('/', scheme + 3);
+        return slash == std::string::npos ? url : url.substr(0, slash);
+    }
+
     vsg::Path joinServerPath(const vsg::Path& serverDir, const vsg::Path& relative)
     {
-        auto dir = serverDir.string();
-        while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\'))
-            dir.pop_back();
-
         auto rel = relative.string();
         // A relative reference inside a glTF may itself use backslashes on a
         // document authored on Windows; a URL wants forward slashes throughout.
         std::replace(rel.begin(), rel.end(), '\\', '/');
-        while (!rel.empty() && rel.front() == '/')
-            rel.erase(rel.begin());
+
+        // An already-absolute reference is not relative to anything.
+        if (rel.find("://") != std::string::npos)
+            return vsg::Path(rel);
+
+        auto dir = serverDir.string();
+        while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\'))
+            dir.pop_back();
+
+        // A reference beginning with '/' is relative to the SERVER ROOT, not to
+        // the document's directory. Dropping the slash and appending it to the
+        // directory -- which is what this did -- turns "/shared/Mesh.bin" into
+        // "http://host/tiles/deep/lod3/shared/Mesh.bin", which 404s, and a glTF
+        // whose buffer 404s still decodes into a scene with no vertices. That
+        // is the same silent failure the backslash produced, reached a
+        // different way.
+        if (!rel.empty() && rel.front() == '/')
+        {
+            if (auto origin = originOf(dir); !origin.empty())
+                return vsg::Path(origin + rel);
+
+            // No recognisable origin to anchor it to; leaving the reference
+            // alone at least fails loudly as itself rather than as a wrong URL.
+            return vsg::Path(rel);
+        }
+
+        // "./" is a no-op, and "../" climbs the directory it is joined to.
+        // Resolving them here rather than sending them to the server matters:
+        // a server is free to 404 an unnormalised path, and several do.
+        while (!rel.empty())
+        {
+            if (rel.compare(0, 2, "./") == 0)
+            {
+                rel.erase(0, 2);
+            }
+            else if (rel.compare(0, 3, "../") == 0)
+            {
+                auto slash = dir.find_last_of('/');
+                // Never climb past the origin: "http://host" has no parent, and
+                // its own "//" carries slashes that would otherwise be eaten,
+                // leaving "http:/" and a dead request.
+                if (slash == std::string::npos || slash < originOf(dir).length())
+                    break;
+                dir.erase(slash);
+                rel.erase(0, 3);
+            }
+            else break;
+        }
 
         return vsg::Path(dir + "/" + rel);
     }

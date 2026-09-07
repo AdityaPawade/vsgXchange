@@ -267,6 +267,46 @@ namespace
     //! vertex attribute with fewer components than the shader declares has the
     //! missing ones filled with (0, 0, 0, 1), which is exactly the alpha of 1.0
     //! glTF requires for a VEC3 COLOR_0.
+    //! Present a base-colour texture as UNORM rather than sRGB.
+    //!
+    //! WHY, because this looks like the wrong thing to do and is not:
+    //!
+    //! glTF base colour IS sRGB-encoded, so VK_FORMAT_*_SRGB is the correct
+    //! description of the bytes and the sampler is right to linearise them. The
+    //! problem is the other end. This renderer's swapchain is UNORM and nothing
+    //! encodes back to sRGB on the way out, so a value the sampler correctly
+    //! linearised is written to the screen as if it were already display-ready.
+    //! Every glTF surface therefore arrives about twice too dark, while the
+    //! terrain -- whose imagery is sampled UNORM and passes straight through --
+    //! is correct beside it. Measured on the operational tilesets: a roof at
+    //! 20/9/5 against a reference of 79/52/40.
+    //!
+    //! Marking base colour UNORM makes it take the same path as the terrain's
+    //! imagery: no linearisation, no re-encode, and the two agree. It is a
+    //! compensation, not a correction -- a linear pipeline end to end (sRGB
+    //! swapchain, sRGB overlay, terrain shaders encoding properly) is the real
+    //! answer, and until then baseColorFactor remains a linear quantity being
+    //! multiplied into sRGB-encoded values, so a dark factor still over-darkens.
+    //!
+    //! Deliberately limited to BASE COLOUR. Normal, metallic-roughness and
+    //! occlusion maps are genuinely linear data and are already stored UNORM;
+    //! touching them would break what currently works.
+    void presentBaseColourAsUnorm(const vsg::ref_ptr<vsg::Data>& image)
+    {
+        if (!image) return;
+
+        switch (image->properties.format)
+        {
+        case VK_FORMAT_R8G8B8A8_SRGB: image->properties.format = VK_FORMAT_R8G8B8A8_UNORM; break;
+        case VK_FORMAT_R8G8B8_SRGB:   image->properties.format = VK_FORMAT_R8G8B8_UNORM;   break;
+        case VK_FORMAT_R8G8_SRGB:     image->properties.format = VK_FORMAT_R8G8_UNORM;     break;
+        case VK_FORMAT_R8_SRGB:       image->properties.format = VK_FORMAT_R8_UNORM;       break;
+        case VK_FORMAT_B8G8R8A8_SRGB: image->properties.format = VK_FORMAT_B8G8R8A8_UNORM; break;
+        case VK_FORMAT_B8G8R8_SRGB:   image->properties.format = VK_FORMAT_B8G8R8_UNORM;   break;
+        default: break;   // already UNORM, compressed, or something else
+        }
+    }
+
     void setVertexFormatFromType(const vsg::ref_ptr<vsg::Data>& array)
     {
         if (!array || array->properties.format != VK_FORMAT_UNDEFINED) return;
@@ -683,6 +723,7 @@ vsg::ref_ptr<vsg::DescriptorConfigurator> gltf::SceneGraphBuilder::createPbrMate
         if (texture.image)
         {
             // vsg::info("Assigned diffuseMap ", texture.image, ", ", texture.sampler);
+            presentBaseColourAsUnorm(texture.image);
             vsg_material->assignTexture("diffuseMap", texture.image, texture.sampler);
             texCoordIndices.diffuseMap = textureInfo.texCoord;
 
@@ -920,6 +961,7 @@ vsg::ref_ptr<vsg::DescriptorConfigurator> gltf::SceneGraphBuilder::createUnlitMa
         if (texture.image)
         {
             // vsg::info("Assigned diffuseMap ", texture.image, ", ", texture.sampler);
+            presentBaseColourAsUnorm(texture.image);
             vsg_material->assignTexture("diffuseMap", texture.image, texture.sampler);
             texCoordIndices.diffuseMap = textureInfo.texCoord;
 
