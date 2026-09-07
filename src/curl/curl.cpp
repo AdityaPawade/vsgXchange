@@ -17,6 +17,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 #include <sstream>
 
 using namespace vsgXchange;
@@ -27,6 +28,37 @@ namespace vsgXchange
     bool containsServerAddress(const vsg::Path& filename)
     {
         return filename.compare(0, 7, "http://") == 0 || filename.compare(0, 8, "https://") == 0;
+    }
+
+    /// Join a server directory to a relative sibling, with a FORWARD SLASH.
+    ///
+    /// vsg::Path::operator/ inserts the platform's native separator, and on
+    /// Windows that is a backslash. Composing a URL with it produced
+    ///
+    ///     http://host:9000/.../LOD-0\Mesh.bin
+    ///
+    /// which is not a URL. curl could not fetch it, the read returned nothing,
+    /// and the glTF reader went on to build a scene whose meshes had no vertex
+    /// data -- so a tileset reported "payloads decoded, 0 failed" and drew
+    /// nothing at all. The failure is silent at every level and only visible in
+    /// the composed string, which nothing printed.
+    ///
+    /// This is Windows-only by nature: on Linux operator/ inserts '/' and the
+    /// same code path works, which is why it went unnoticed.
+    vsg::Path joinServerPath(const vsg::Path& serverDir, const vsg::Path& relative)
+    {
+        auto dir = serverDir.string();
+        while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\'))
+            dir.pop_back();
+
+        auto rel = relative.string();
+        // A relative reference inside a glTF may itself use backslashes on a
+        // document authored on Windows; a URL wants forward slashes throughout.
+        std::replace(rel.begin(), rel.end(), '\\', '/');
+        while (!rel.empty() && rel.front() == '/')
+            rel.erase(rel.begin());
+
+        return vsg::Path(dir + "/" + rel);
     }
 
     std::pair<vsg::Path, vsg::Path> getServerPathAndFilename(const vsg::Path& filename)
@@ -88,6 +120,7 @@ vsg::ref_ptr<vsg::Object> curl::read(const vsg::Path& filename, vsg::ref_ptr<con
 
     bool contains_serverAddress = containsServerAddress(filename);
 
+
     if (options)
     {
         if (!contains_serverAddress && !options->paths.empty())
@@ -95,7 +128,7 @@ vsg::ref_ptr<vsg::Object> curl::read(const vsg::Path& filename, vsg::ref_ptr<con
             contains_serverAddress = containsServerAddress(options->paths.front());
             if (contains_serverAddress)
             {
-                serverFilename = options->paths.front() / filename;
+                serverFilename = joinServerPath(options->paths.front(), filename);
             }
         }
 
