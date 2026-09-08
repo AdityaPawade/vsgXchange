@@ -491,7 +491,19 @@ vsg::ref_ptr<vsg::Object> Tiles3D::read_i3dm(std::istream& fin, vsg::ref_ptr<con
         vsg::decompose(rot_matrix, temp_translation, rotation, temp_scale);
     };
 
+    // GPU instancing puts the i3dm's models under a vsg::InstanceNode and asks
+    // the glTF reader for instancing-capable geometry (instanceNodeHint below).
+    // When that pairing does not hold, the failure is silent and expensive: the
+    // payload decodes, reports its instance count and its texture bytes, is
+    // counted as healthy geometry -- and draws nothing at all.
+    //
+    // VSGX_NO_I3DM_INSTANCING=1 falls back to a plain group of MatrixTransforms,
+    // one per instance. Heavier, and it always draws. Keep it as the way to
+    // answer "is instancing the reason this tileset is invisible?" in one run
+    // instead of a rebuild.
     bool gpuInstancing = vsg::value<bool>(true, Tiles3D::instancing, options);
+    if (const char* off = std::getenv("VSGX_NO_I3DM_INSTANCING"))
+        if (off[0] == '1') gpuInstancing = false;
 
     auto opt = vsg::clone(options);
     opt->extensionHint = ".glb";
