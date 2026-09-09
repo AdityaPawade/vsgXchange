@@ -9,7 +9,7 @@ use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
 the Software, and to permit persons to whom the Software is furnished to do so,
 subject to the following conditions:
 
-The above copyright notice and this permission notice shimages be included in images
+The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
@@ -54,6 +54,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <vsg/utils/GraphicsPipelineConfigurator.h>
 
 #include <vsg/io/write.h>
+
+#include <cmath>   // std::pow, for the base-colour factor encode
 
 #ifdef vsgXchange_draco
 #    include "draco/compression/decode.h"
@@ -314,6 +316,56 @@ namespace
         case VK_FORMAT_B8G8R8_SRGB:   image->properties.format = VK_FORMAT_B8G8R8_UNORM;   break;
         default: break;   // already UNORM, compressed, or something else
         }
+    }
+
+    //! Put a base-colour FACTOR into the same encoding its texture is in.
+    //!
+    //! THE OTHER HALF OF presentBaseColourAsUnorm, and exactly the residual
+    //! that function's own comment predicted: "baseColorFactor remains a linear
+    //! quantity being multiplied into sRGB-encoded values, so a dark factor
+    //! still over-darkens."
+    //!
+    //! glTF defines baseColorFactor as LINEAR. Presenting the texture as UNORM
+    //! means its sRGB-encoded bytes pass through un-linearised -- deliberately,
+    //! so that glTF matches the terrain beside it. The shader then multiplies
+    //! the two, and the operands are in different spaces. The factor has to be
+    //! encoded the way the texture already is.
+    //!
+    //! MEASURED on i3dm_city's roofs, which is what made this findable. The
+    //! roof texture is neutral grey (142, 138, 135), so the colour comes
+    //! entirely from a factor of [1, 0.798, 0.735]. Multiplied as a linear
+    //! quantity that gives (142, 110, 99), a dark brick red. Encoded first it
+    //! gives (142, 125, 118), a light warm terracotta -- which is what the
+    //! reference renderer shows for the same buildings at the same camera
+    //! position.
+    //!
+    //! THE ERROR IS CHROMATIC rather than a uniform dimming, which is why it
+    //! reads as over-saturated as much as too dark, and why it was missed: a
+    //! factor of 1.0 is unchanged while 0.735 moves by 19%. The walls of these
+    //! buildings looked correct throughout precisely because their factor is
+    //! near 1.0 in every channel, so only the roofs gave it away.
+    //!
+    //! Alpha is not touched: it is coverage, not colour, and has no encoding.
+    vsg::vec4 encodeBaseColourFactor(const vsg::vec4& linear)
+    {
+        // Tied to the same switch as the texture half. The two are one
+        // compensation, and disabling half would leave the pipeline less
+        // consistent than either end state.
+        static const bool disabled = []{
+            const char* v = std::getenv("VSGX_NO_GLTF_UNORM");
+            return v && *v && *v != '0';
+        }();
+        if (disabled) return linear;
+
+        auto encode = [](float c) -> float {
+            if (c <= 0.0f) return 0.0f;
+            if (c >= 1.0f) return 1.0f;      // 1.0 stays 1.0, as it must
+            return (c <= 0.0031308f) ? (c * 12.92f)
+                                     : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
+        };
+
+        return vsg::vec4(encode(linear.r), encode(linear.g), encode(linear.b),
+                         linear.a);
     }
 
     void setVertexFormatFromType(const vsg::ref_ptr<vsg::Data>& array)
@@ -721,7 +773,9 @@ vsg::ref_ptr<vsg::DescriptorConfigurator> gltf::SceneGraphBuilder::createPbrMate
     if (gltf_material->pbrMetallicRoughness.baseColorFactor.values.size() == 4)
     {
         auto& baseColorFactor = gltf_material->pbrMetallicRoughness.baseColorFactor.values;
-        pbrMaterial.baseColorFactor.set(baseColorFactor[0], baseColorFactor[1], baseColorFactor[2], baseColorFactor[3]);
+        pbrMaterial.baseColorFactor = encodeBaseColourFactor(
+            vsg::vec4(baseColorFactor[0], baseColorFactor[1],
+                      baseColorFactor[2], baseColorFactor[3]));
         // vsg::info("Assigned baseColorFacator ", pbrMaterial.baseColorFactor);
     }
 
@@ -959,7 +1013,9 @@ vsg::ref_ptr<vsg::DescriptorConfigurator> gltf::SceneGraphBuilder::createUnlitMa
     if (gltf_material->pbrMetallicRoughness.baseColorFactor.values.size() == 4)
     {
         auto& baseColorFactor = gltf_material->pbrMetallicRoughness.baseColorFactor.values;
-        phongMaterial.diffuse.set(baseColorFactor[0], baseColorFactor[1], baseColorFactor[2], baseColorFactor[3]);
+        phongMaterial.diffuse = encodeBaseColourFactor(
+            vsg::vec4(baseColorFactor[0], baseColorFactor[1],
+                      baseColorFactor[2], baseColorFactor[3]));
         // vsg::info("Assigned phongMaterial.diffuse ", pbrMaterial.baseColorFactor);
     }
 
